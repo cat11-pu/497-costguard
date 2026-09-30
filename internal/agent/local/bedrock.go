@@ -1,0 +1,685 @@
+package local
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"sort"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+
+	"github.com/scoutme/milk/internal/obs"
+	"github.com/scoutme/milk/internal/workflow"
+)
+
+// --- Bedrock Converse API request/response types ---
+
+type bedrockRequest struct {
+	Messages   []bedrockMessage   `json:"messages"`
+	System     []bedrockSystem    `json:"system,omitempty"`
+	ToolConfig *bedrockToolConfig `json:"toolConfig,omitempty"`
+}
+
+// bedrockSystem is a SystemContentBlock union member: exactly one of Text or
+// CachePoint is set. See:
+// https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_SystemContentBlock.html
+type bedrockSystem struct {
+	Text       string             `json:"text,omitempty"`
+	CachePoint *bedrockCachePoint `json:"cachePoint,omitempty"`
+}
+
+// bedrockCachePoint marks the end of a reusable prefix for AWS Bedrock's
+// explicit prompt caching. Shape confirmed against AWS's Converse API
+// reference (retrieved 2026-08-17), not guessed:
+// https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_CachePointBlock.html
+type bedrockCachePoint struct {
+	Type string `json:"type"`
+}
+
+type bedrockMessage struct {
+	Role    string                `json:"role"`
+	Content []bedrockContentBlock `json:"content"`
+}
+
+type bedrockContentBlock struct {
+	Text       string             `json:"text,omitempty"`
+	ToolUse    *bedrockToolUse    `json:"toolUse,omitempty"`
+	ToolResult *bedrockToolResult `json:"toolResult,omitempty"`
+	CachePoint *bedrockCachePoint `json:"cachePoint,omitempty"`
+}
+
+type bedrockToolUse struct {
+	ToolUseID string         `json:"toolUseId"`
+	Name      string         `json:"name"`
+	Input     map[string]any `json:"input"`
+}
+
+type bedrockToolResult struct {
+	ToolUseID string                     `json:"toolUseId"`
+	Content   []bedrockToolResultContent `json:"content"`
+}
+
+type bedrockToolResultContent struct {
+	Text string `json:"text"`
+}
+
+type bedrockToolConfig struct {
+	Tools []bedrockTool `json:"tools"`
+}
+
+type bedrockTool struct {
+	ToolSpec bedrockToolSpec `json:"toolSpec"`
+}
+
+type bedrockToolSpec struct {
+	Name        string             `json:"name"`
+	Description string             `json:"description"`
+	InputSchema bedrockInputSchema `json:"inputSchema"`
+}
+
+type bedrockInputSchema struct {
+	JSON map[string]any `json:"json"`
+}
+
+// Synchronous Converse response (used for classification).
+type bedrockConverseResponse struct {
+	Output struct {
+		Message bedrockMessage `json:"message"`
+	} `json:"output"`
+	StopReason string `json:"stopReason"`
+	Usage      struct {
+		InputTokens  int64 `json:"inputTokens"`
+		OutputTokens int64 `json:"outputTokens"`
+	} `json:"usage"`
+}
+
+// --- Streaming event structs ---
+
+type bedrockContentBlockStartEvent struct {
+	ContentBlockIndex int `json:"contentBlockIndex"`
+	Start             struct {
+		ToolUse *struct {
+			ToolUseID string `json:"toolUseId"`
+			Name      string `json:"name"`
+		} `json:"toolUse,omitempty"`
+	} `json:"start"`
+}
+
+type bedrockContentBlockDeltaEvent struct {
+	ContentBlockIndex int `json:"contentBlockIndex"`
+	Delta             struct {
+		Text    string `json:"text,omitempty"`
+		ToolUse *struct {
+			Input string `json:"input"`
+		} `json:"toolUse,omitempty"`
+	} `json:"delta"`
+}
+
+type bedrockMetadataEvent struct {
+	Usage struct {
+		InputTokens  int64 `json:"inputTokens"`
+		OutputTokens int64 `json:"outputTokens"`
+		// CacheReadInputTokens/CacheWriteInputTokens are populated only when the
+		// request included explicit cachePoint blocks (not sent by milk yet —
+		// this is response-parsing only, per AWS's Converse API TokenUsage shape:
+		// https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_TokenUsage.html
+		CacheReadInputTokens  int64 `json:"cacheReadInputTokens,omitempty"`
+		CacheWriteInputTokens int64 `json:"cacheWriteInputTokens,omitempty"`
+	} `json:"usage"`
+}
+
+// --- Conversion helpers ---
+
+// convertMessagesToConverse translates OpenAI-format messages to Bedrock Converse format.
+// System messages (any position) are extracted into a separate slice.
+// Consecutive tool-result messages are merged into a single user message (Bedrock requirement).
+func convertMessagesToConverse(msgs []Message) ([]bedrockMessage, []bedrockSystem) {
+	var system []bedrockSystem
+	var result []bedrockMessage
+
+	for _, m := range msgs {
+		switch m.Role {
+		case "system":
+			if m.Content != "" {
+				system = append(system, bedrockSystem{Text: m.Content})
+			}
+
+		case "user":
+			if m.Content != "" {
+				result = append(result, bedrockMessage{
+					Role:    "user",
+					Content: []bedrockContentBlock{{Text: m.Content}},
+				})
+			}
+
+		case "tool":
+			block := bedrockContentBlock{
+				ToolResult: &bedrockToolResult{
+					ToolUseID: m.ToolCallID,
+					Content:   []bedrockToolResultContent{{Text: m.Content}},
+				},
+			}
+			// Merge consecutive tool results into one user message (Bedrock requires this).
+			if n := len(result); n > 0 &&
+				result[n-1].Role == "user" &&
+				len(result[n-1].Content) > 0 &&
+				result[n-1].Content[0].ToolResult != nil {
+				result[n-1].Content = append(result[n-1].Content, block)
+			} else {
+				result = append(result, bedrockMessage{
+					Role:    "user",
+					Content: []bedrockContentBlock{block},
+				})
+			}
+
+		case "assistant":
+			var content []bedrockContentBlock
+			if m.Content != "" {
+				content = append(content, bedrockContentBlock{Text: m.Content})
+			}
+			for _, tc := range m.ToolCalls {
+				var input map[string]any
+				json.Unmarshal([]byte(tc.Function.Arguments), &input) //nolint:errcheck
+				if input == nil {
+					input = map[string]any{}
+				}
+				content = append(content, bedrockContentBlock{
+					ToolUse: &bedrockToolUse{
+						ToolUseID: tc.ID,
+						Name:      tc.Function.Name,
+						Input:     input,
+					},
+				})
+			}
+			if len(content) > 0 {
+				result = append(result, bedrockMessage{Role: "assistant", Content: content})
+			}
+		}
+	}
+
+	return result, system
+}
+
+// appendSystemCachePoint inserts an explicit cachePoint block right after
+// the *first* element of the system array, not at the end, opting the
+// stable system-prompt prefix into AWS Bedrock's explicit prompt caching
+// (see AgentConfig.PromptCaching). No-op when system is empty: a lone
+// cachePoint block with no preceding content has no prefix to mark as
+// reusable.
+//
+// Position matters here: convertMessagesToConverse flattens every
+// role=="system" message into its own system[] entry, in order. system[0]
+// is always the large, mostly-static buildSystemPrompt output (see Run's
+// msgs := []Message{{Role: "system", Content: systemPrompt}}); any percepts
+// or current-need orientation are separate system-role messages prepended
+// into history *after* that (runner.go), so they land at system[1:] —
+// small and turn-to-turn-varying. Placing the cachePoint at the very end
+// (the original behavior) bundled the stable prompt and the dynamic
+// entries into one cached unit, invalidating the whole thing — including
+// the expensive-to-reprocess system prompt — on every percept/need change.
+// Anchoring it right after system[0] instead caches only the part that's
+// actually stable, independent of what comes after.
+func appendSystemCachePoint(system []bedrockSystem) []bedrockSystem {
+	if len(system) == 0 {
+		return system
+	}
+	out := make([]bedrockSystem, 0, len(system)+1)
+	out = append(out, system[0], bedrockSystem{CachePoint: &bedrockCachePoint{Type: "default"}})
+	return append(out, system[1:]...)
+}
+
+// appendMessageCachePoints marks the last two messages as cache breakpoints
+// (a rolling "double buffer"), in addition to the single system-prefix
+// breakpoint appendSystemCachePoint adds. The system prefix alone only
+// caches the (small, mostly-static) system prompt; the conversation/tool-
+// call history is what actually grows during a tool loop, and previously
+// had no cache breakpoint at all.
+//
+// Marking only the single last message would mean any retry, edit, or
+// removal of that message drops its marker and forces a full-prefix
+// recompute; marking the last two means the next-to-last marker survives as
+// a fallback anchor, degrading the worst case to "recompute only the
+// removed message" instead. This is the same double-buffer strategy
+// MiMo-Code and OpenCode converged on independently — see
+// docs/prompt-context-management-review.md §8 rec #11. Bedrock allows up to
+// 4 cache breakpoints total; this uses at most 3 (1 system + 2 message) to
+// leave headroom.
+//
+// EXPERIMENTAL, like the rest of this file's prompt-caching support: not
+// live-tested against a real Bedrock endpoint (no Bedrock agent was
+// available during development).
+func appendMessageCachePoints(messages []bedrockMessage) []bedrockMessage {
+	n := len(messages)
+	if n == 0 {
+		return messages
+	}
+	start := max(n-2, 0)
+	for i := start; i < n; i++ {
+		messages[i].Content = append(messages[i].Content, bedrockContentBlock{CachePoint: &bedrockCachePoint{Type: "default"}})
+	}
+	return messages
+}
+
+// convertToolsToConverse translates OpenAI tool schemas to Bedrock ToolSpec format.
+func convertToolsToConverse(tools []map[string]any) []bedrockTool {
+	var result []bedrockTool
+	for _, t := range tools {
+		fn, ok := t["function"].(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _ := fn["name"].(string)
+		desc, _ := fn["description"].(string)
+		params, _ := fn["parameters"].(map[string]any)
+		if params == nil {
+			params = map[string]any{"type": "object", "properties": map[string]any{}}
+		}
+		result = append(result, bedrockTool{
+			ToolSpec: bedrockToolSpec{
+				Name:        name,
+				Description: desc,
+				InputSchema: bedrockInputSchema{JSON: params},
+			},
+		})
+	}
+	return result
+}
+
+// converseEndpoint constructs the Bedrock Converse API URL.
+// stream=true → converse-stream (AWS Event Stream); stream=false → converse (JSON).
+// The model ID (which may be an ARN containing colons) is encoded with awsURIEncodeModel
+// so that colons become %3A but slashes remain as path separators. The SigV4 transport
+// then re-encodes each segment for the canonical URI (e.g. %3A → %253A).
+func (a *Agent) converseEndpoint(stream bool) string {
+	encodedModel := awsURIEncodeModel(a.model)
+	if stream {
+		return a.baseURL + "/model/" + encodedModel + "/converse-stream"
+	}
+	return a.baseURL + "/model/" + encodedModel + "/converse"
+}
+
+// bedrockStreamCompletion implements streamCompletion using the Bedrock Converse streaming API.
+func (a *Agent) bedrockStreamCompletion(ctx context.Context, msgs []Message, tools []map[string]any, out io.Writer) (string, string, []toolCall, bool, string, error) {
+	bedrockMsgs, system := convertMessagesToConverse(msgs)
+	if a.promptCaching {
+		system = appendSystemCachePoint(system)
+		bedrockMsgs = appendMessageCachePoints(bedrockMsgs)
+	}
+	bedrockTools := convertToolsToConverse(tools)
+
+	reqBody := bedrockRequest{
+		Messages: bedrockMsgs,
+		System:   system,
+	}
+	if len(bedrockTools) > 0 {
+		reqBody.ToolConfig = &bedrockToolConfig{Tools: bedrockTools}
+	}
+
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", "", nil, false, "", err
+	}
+	if a.onRequestSize != nil {
+		a.onRequestSize(int64(len(body)))
+	}
+	if a.logContext {
+		obs.LogPayload(a.converseEndpoint(true), body)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.converseEndpoint(true), bytes.NewReader(body))
+	if err != nil {
+		return "", "", nil, false, "", err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	inferenceStart := time.Now()
+	httpResp, err := a.client.Do(httpReq)
+	if err != nil {
+		obs.Inc(ctx, inferenceScope, "milk.inference.errors",
+			attribute.String("model", a.model),
+			attribute.String("agent", agentRoleForMetrics(a.escalationName)),
+			attribute.String("kind", "http"),
+		)
+		obs.Warn("inference request failed",
+			"model", a.model, "agent", agentRoleForMetrics(a.escalationName), "provider", "bedrock",
+			"err", err.Error(), "elapsed", time.Since(inferenceStart).String(),
+			"retryable", workflow.IsRetryableTurnError(err),
+		)
+		return "", "", nil, false, "", fmt.Errorf("bedrock unreachable: %w", err)
+	}
+	defer httpResp.Body.Close()
+
+	if httpResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(httpResp.Body)
+		obs.Inc(ctx, inferenceScope, "milk.inference.errors",
+			attribute.String("model", a.model),
+			attribute.String("agent", agentRoleForMetrics(a.escalationName)),
+			attribute.String("kind", "http"),
+		)
+		obs.Warn("inference request returned non-200",
+			"model", a.model, "agent", agentRoleForMetrics(a.escalationName), "provider", "bedrock",
+			"status", httpResp.StatusCode, "body", string(b),
+			"elapsed", time.Since(inferenceStart).String(),
+		)
+		return "", "", nil, false, "", fmt.Errorf("bedrock error %d: %s", httpResp.StatusCode, b)
+	}
+
+	type partialTC struct {
+		toolUseID string
+		name      string
+		inputBuf  strings.Builder
+	}
+	toolBlocks := map[int]*partialTC{}
+	var textBuf strings.Builder
+
+	// See the matching comment in scanSSE (local.go) — same observability gap
+	// (a mid-stream read failure returning bare, an idle-but-open connection
+	// looking identical to dead silence), same fix, adapted to Bedrock's
+	// event-stream framing (readBedrockEvent) instead of bufio.Scanner lines.
+	streamStartedAt := time.Now()
+	var events atomic.Int64
+	var lastEventAtNano atomic.Int64
+	lastEventAtNano.Store(streamStartedAt.UnixNano())
+	heartbeatDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(streamIdleLogInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-heartbeatDone:
+				return
+			case <-ticker.C:
+				idle := time.Since(time.Unix(0, lastEventAtNano.Load()))
+				if idle >= streamIdleLogInterval {
+					obs.Warn("stream idle",
+						"model", a.model, "agent", agentRoleForMetrics(a.escalationName), "provider", "bedrock",
+						"events_read", events.Load(),
+						"elapsed_since_start", time.Since(streamStartedAt).String(),
+						"elapsed_since_last_chunk", idle.String(),
+					)
+				}
+			}
+		}
+	}()
+	defer close(heartbeatDone)
+
+	done := false
+	for !done {
+		eventType, payload, err := readBedrockEvent(httpResp.Body)
+		if err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				break
+			}
+			obs.Warn("stream read failed",
+				"model", a.model, "agent", agentRoleForMetrics(a.escalationName), "provider", "bedrock",
+				"err", err.Error(),
+				"events_read", events.Load(),
+				"elapsed_since_start", time.Since(streamStartedAt).String(),
+				"elapsed_since_last_chunk", time.Since(time.Unix(0, lastEventAtNano.Load())).String(),
+				"content_bytes", textBuf.Len(),
+				"retryable", workflow.IsRetryableTurnError(err),
+			)
+			return "", "", nil, false, "", fmt.Errorf("bedrock stream: %w", err)
+		}
+		events.Add(1)
+		lastEventAtNano.Store(time.Now().UnixNano())
+
+		switch eventType {
+		case "contentBlockStart":
+			// Payload is the inner struct directly (not wrapped in an outer key).
+			var ev bedrockContentBlockStartEvent
+			if json.Unmarshal(payload, &ev) == nil && ev.Start.ToolUse != nil {
+				toolBlocks[ev.ContentBlockIndex] = &partialTC{
+					toolUseID: ev.Start.ToolUse.ToolUseID,
+					name:      ev.Start.ToolUse.Name,
+				}
+			}
+
+		case "contentBlockDelta":
+			// Payload is the inner struct directly (not wrapped in an outer key).
+			var ev bedrockContentBlockDeltaEvent
+			if json.Unmarshal(payload, &ev) != nil {
+				continue
+			}
+			if ev.Delta.Text != "" {
+				textBuf.WriteString(ev.Delta.Text)
+				if out != nil {
+					fmt.Fprint(out, ev.Delta.Text)
+				}
+			}
+			if ev.Delta.ToolUse != nil {
+				if tc := toolBlocks[ev.ContentBlockIndex]; tc != nil {
+					tc.inputBuf.WriteString(ev.Delta.ToolUse.Input)
+				}
+			}
+
+		case "messageStop":
+			done = true
+
+		case "metadata":
+			var ev bedrockMetadataEvent
+			if json.Unmarshal(payload, &ev) == nil {
+				role := agentRoleForMetrics(a.escalationName)
+				obs.RecordTokens(ctx, a.model, role, ev.Usage.InputTokens, ev.Usage.OutputTokens)
+				if a.onTokens != nil {
+					// cacheRead/cacheCreation are 0 today since milk never sends
+					// an explicit cachePoint block yet (that's a separate,
+					// request-side sprint) — parsing them here is forward
+					// compatible and a no-op until that lands.
+					a.onTokens(a.model, role, ev.Usage.InputTokens, ev.Usage.OutputTokens, ev.Usage.CacheReadInputTokens, ev.Usage.CacheWriteInputTokens)
+				}
+			}
+
+		default:
+			// exception variants — surface them as errors
+			if strings.Contains(eventType, "Exception") || strings.Contains(eventType, "exception") {
+				obs.Warn("stream exception event",
+					"model", a.model, "agent", agentRoleForMetrics(a.escalationName), "provider", "bedrock",
+					"event_type", eventType, "payload", string(payload),
+					"events_read", events.Load(),
+					"elapsed_since_start", time.Since(streamStartedAt).String(),
+				)
+				return "", "", nil, false, "", fmt.Errorf("bedrock %s: %s", eventType, string(payload))
+			}
+		}
+	}
+
+	role := agentRoleForMetrics(a.escalationName)
+	obs.RecordDuration(ctx, inferenceScope, "milk.inference.latency_ms", time.Since(inferenceStart),
+		attribute.String("model", a.model),
+		attribute.String("agent", role),
+		attribute.String("provider", "bedrock"),
+	)
+
+	// Collect tool calls ordered by content block index.
+	type indexedTC struct {
+		idx int
+		tc  toolCall
+	}
+	var indexed []indexedTC
+	for idx, tc := range toolBlocks {
+		indexed = append(indexed, indexedTC{
+			idx: idx,
+			tc: toolCall{
+				ID:   tc.toolUseID,
+				Type: "function",
+				Function: toolCallFunction{
+					Name:      tc.name,
+					Arguments: tc.inputBuf.String(),
+				},
+			},
+		})
+	}
+	sort.Slice(indexed, func(i, j int) bool { return indexed[i].idx < indexed[j].idx })
+	var tcList []toolCall
+	for _, itc := range indexed {
+		tcList = append(tcList, itc.tc)
+	}
+
+	if len(tcList) > 0 {
+		if out != nil && textBuf.Len() > 0 {
+			fmt.Fprintln(out)
+		}
+		return textBuf.String(), "", tcList, false, "", nil
+	}
+	if out != nil && textBuf.Len() > 0 {
+		fmt.Fprintln(out)
+	}
+	// No tool calls and possibly no text: a degenerate/empty completion. Flag
+	// it so Run() can fall back to a summary of this turn's tool activity
+	// instead of persisting (or discarding) a blank assistant message.
+	return textBuf.String(), "", nil, textBuf.Len() == 0, "", nil
+}
+
+// bedrockClassify uses the synchronous Bedrock Converse API for routing classification.
+func (a *Agent) bedrockClassify(ctx context.Context, prompt string) (bool, error) {
+	classifyPrompt := `You are a routing classifier. Respond with exactly one word: "primary" or "escalate".
+Respond "escalate" only if the task clearly requires: complex multi-file refactoring, architectural design decisions, or tasks that require deep reasoning beyond coding assistance.
+Respond "primary" for: shell commands, file reading, grep, simple code questions, debugging, writing small functions.
+
+Task: ` + prompt
+
+	reqBody := bedrockRequest{
+		Messages: []bedrockMessage{
+			{Role: "user", Content: []bedrockContentBlock{{Text: classifyPrompt}}},
+		},
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return false, err
+	}
+	if a.logContext {
+		obs.LogPayload(a.converseEndpoint(false)+" [classify]", body)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.converseEndpoint(false), bytes.NewReader(body))
+	if err != nil {
+		return false, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	httpResp, err := a.client.Do(httpReq)
+	if err != nil {
+		return false, fmt.Errorf("bedrock unreachable: %w", err)
+	}
+	defer httpResp.Body.Close()
+
+	if httpResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(httpResp.Body)
+		return false, fmt.Errorf("bedrock error %d: %s", httpResp.StatusCode, b)
+	}
+
+	var result bedrockConverseResponse
+	if err := json.NewDecoder(httpResp.Body).Decode(&result); err != nil {
+		return false, err
+	}
+	obs.RecordTokens(ctx, a.model, "router", result.Usage.InputTokens, result.Usage.OutputTokens)
+	for _, block := range result.Output.Message.Content {
+		if block.Text != "" {
+			return strings.HasPrefix(strings.TrimSpace(strings.ToLower(block.Text)), "escalate"), nil
+		}
+	}
+	return false, nil
+}
+
+// --- AWS Event Stream decoder ---
+
+// readBedrockEvent reads one event from an AWS Event Stream (binary framing).
+//
+// Frame layout (all integers big-endian):
+//
+//	[0:4]   total byte length (includes all fields including itself)
+//	[4:8]   headers byte length
+//	[8:12]  prelude CRC32
+//	[12:12+headersLen] headers
+//	[12+headersLen : totalLen-4] payload (JSON)
+//	[totalLen-4:totalLen] message CRC32
+func readBedrockEvent(r io.Reader) (eventType string, payload []byte, err error) {
+	var prelude [8]byte
+	if _, err = io.ReadFull(r, prelude[:]); err != nil {
+		return
+	}
+	totalLen := binary.BigEndian.Uint32(prelude[0:4])
+	headersLen := binary.BigEndian.Uint32(prelude[4:8])
+
+	// Skip prelude CRC (4 bytes).
+	if _, err = io.ReadFull(r, make([]byte, 4)); err != nil {
+		return
+	}
+
+	headerBytes := make([]byte, headersLen)
+	if _, err = io.ReadFull(r, headerBytes); err != nil {
+		return
+	}
+
+	// payloadLen = total - prelude(8) - preludeCRC(4) - headers(headersLen) - messageCRC(4)
+	payloadLen := int(totalLen) - 16 - int(headersLen)
+	if payloadLen < 0 {
+		err = fmt.Errorf("invalid bedrock event: negative payload (%d)", payloadLen)
+		return
+	}
+	payload = make([]byte, payloadLen)
+	if _, err = io.ReadFull(r, payload); err != nil {
+		return
+	}
+
+	// Skip message CRC (4 bytes).
+	if _, err = io.ReadFull(r, make([]byte, 4)); err != nil {
+		return
+	}
+
+	eventType = parseBedrockHeader(headerBytes, ":event-type")
+	if eventType == "" {
+		if parseBedrockHeader(headerBytes, ":message-type") == "exception" {
+			eventType = parseBedrockHeader(headerBytes, ":exception-type")
+			if eventType == "" {
+				eventType = "exception"
+			}
+		}
+	}
+	return
+}
+
+// parseBedrockHeader extracts a named string header value from an encoded headers block.
+// Only handles value type 7 (string); stops at the first unrecognised type.
+func parseBedrockHeader(data []byte, target string) string {
+	i := 0
+	for i < len(data) {
+		nameLen := int(data[i])
+		i++
+		if i+nameLen > len(data) {
+			return ""
+		}
+		name := string(data[i : i+nameLen])
+		i += nameLen
+		if i >= len(data) {
+			return ""
+		}
+		vtype := data[i]
+		i++
+		if vtype != 7 { // only string type supported; can't skip unknown types safely
+			return ""
+		}
+		if i+2 > len(data) {
+			return ""
+		}
+		vlen := int(binary.BigEndian.Uint16(data[i : i+2]))
+		i += 2
+		if i+vlen > len(data) {
+			return ""
+		}
+		val := string(data[i : i+vlen])
+		i += vlen
+		if name == target {
+			return val
+		}
+	}
+	return ""
+}

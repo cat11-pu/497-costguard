@@ -1,0 +1,1713 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"slices"
+	"strings"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/scoutme/milk/internal/agent/local"
+	"github.com/scoutme/milk/internal/claudesettings"
+	"github.com/scoutme/milk/internal/config"
+	"github.com/scoutme/milk/internal/mcp"
+	"github.com/scoutme/milk/internal/memory"
+	"github.com/scoutme/milk/internal/obs"
+	"github.com/scoutme/milk/internal/oversight"
+	"github.com/scoutme/milk/internal/session"
+)
+
+const cmdAttach = "/attach"
+const cmdWorkflow = "/workflow"
+const cmdReload = "/reload"
+const cmdTasks = "/tasks"
+const cmdTask = "/task"
+const cmdEscalate = "/escalate"
+const cmdPrimary = "/primary"
+const cmdPaste = "/paste"
+const cmdLearn = "/learn"
+const cmdOtel = "/otel"
+const cmdMetrics = "/metrics"
+const cmdUsage = "/usage"
+const cmdMemory = "/memory"
+const cmdExport = "/export"
+const cmdHistory = "/history"
+const cmdPanel = "/panel"
+const cmdForget = "/forget"
+const cmdSkipPerms = "/skip-permissions"
+const cmdAgent = "/agent"
+const cmdColorize = "/colorize"
+const cmdThink = "/think"
+const cmdSetup = "/setup"
+const cmdConfig = "/config"
+const cmdOpen = "/open"
+const cmdMCP = "/mcp"
+const cmdUpdate = "/update"
+const cmdServer = "/server"
+const cmdBash = "/bash"
+const cmdBg = "/bg"
+
+var slashCommands = []string{
+	cmdEscalate, cmdPrimary, cmdPaste, cmdLearn, cmdOtel, cmdMetrics, cmdUsage, cmdMemory, cmdExport, cmdHistory, cmdPanel, cmdForget, cmdSkipPerms, cmdAgent, cmdColorize, cmdThink, cmdSetup, cmdConfig, cmdOpen, cmdMCP, cmdUpdate, cmdWorkflow, cmdServer, cmdReload, cmdTasks, cmdTask, cmdAttach, cmdBash, cmdBg,
+	"/new", "/drop", "/list", "/help", "/exit", "/quit",
+}
+
+// initWizardState tracks state for the /config init TUI wizard.
+type initWizardState struct {
+	step    initWizardStep
+	primary config.AgentConfig
+	escCLI  bool // whether to use default claude-cli escalation
+	// limits step
+	contextWindowTokens int // context_window_tokens (0 = not set); message_budget_chars/
+	// max_tool_iterations are auto-derived from this by AgentMessageBudget/
+	// AgentContextWindowTokens, not asked separately.
+	// agent-tools step
+	toolAgentNames []string // agent names the user wants to enable as tools
+}
+
+type initWizardStep int
+
+const (
+	initStepName       initWizardStep = iota // ask agent name
+	initStepProvider                         // ask provider (menu 1–6)
+	initStepURL                              // ask URL (providers that need it)
+	initStepChatPath                         // ask chat_path (bearer only, skip if standard)
+	initStepRunCmd                           // ask run_cmd (local provider only, optional)
+	initStepModel                            // ask model
+	initStepAuth                             // ask api_key (blank → go to initStepTokenCmd)
+	initStepTokenCmd                         // ask token_cmd
+	initStepAWSRegion                        // ask aws_region (bedrock only)
+	initStepLimits                           // ask context_window_tokens (proposes a models.dev catalog match)
+	initStepEscalation                       // ask escalation agent choice
+	initStepAgentTools                       // ask which agents to enable as tools
+	initStepOpenConfig                       // ask whether to open config in editor
+	initStepDone
+)
+
+// telegramSetupState tracks state for the /setup telegram wizard.
+type telegramSetupState struct {
+	token   string
+	chatID  int64
+	botName string // @username of the bot, set after token validation
+	step    telegramSetupStep
+}
+
+type telegramSetupStep int
+
+const (
+	telegramStepToken   telegramSetupStep = iota // waiting for token input
+	telegramStepWaitMsg                          // token validated; waiting for user to message the bot
+	telegramStepDone
+)
+
+func promptLabel(_ *interactiveState) string {
+	return "❯ "
+}
+
+const interactiveHelp = `
+── Routing ──────────────────────────────────────────────────────────────
+  /escalate              pin all turns to escalation agent (/primary to unpin)
+  /escalate <msg>        force this turn to escalation agent, then resume routing
+  /escalate fresh        force a new escalation context (new session + memory instructions re-injected)
+  /escalate fresh <msg>  same, single-turn override
+  /primary               pin all turns to primary agent (/escalate to unpin)
+  /primary <msg>         force this turn to primary agent, then resume routing
+
+── Sessions ─────────────────────────────────────────────────────────────
+  /list                  list sessions for current directory
+  /new                   start a fresh session
+  /drop                  delete current session
+  /export                print session transcript (text)
+  /export json           print session transcript as JSON
+  /export <path>         write session transcript to file
+
+── Agents ───────────────────────────────────────────────────────────────
+  /agent                 show active primary and escalation agents
+  /agent list            list all configured agents (* = active)
+  /agent add             add a new agent interactively
+  /agent add name=… url=… model=… [provider=…] [api_key=…] [aws_region=…] [run_cmd=…]
+  /agent remove <name>   remove an agent from config (must not be active)
+  /agent switch <name> [as primary|escalation]   (prompts if args missing)
+  /agent tool list [<agent>|global]              show tool-agents (default: primary)
+  /agent tool enable <tool> [for <agent>|global]  enable a tool-agent entry
+  /agent tool disable <tool> [for <agent>|global]  disable a tool-agent entry
+  /agent tool add <tool> description=<desc> [for <agent>|global]  add a new tool-agent entry
+  /agent tool remove <tool> [for <agent>|global]  remove a tool-agent entry
+  /skip-permissions      show current skip-permissions state
+  /skip-permissions on   all agents auto-approve tool uses (no prompts)
+  /skip-permissions off  agents prompt before running side-effecting tools
+
+── Memory ───────────────────────────────────────────────────────────────
+  /learn <fact>          store a persistent memory
+  /memory                list all percepts (session + global)
+  /memory global         list only global percepts
+  /memory session        list only session percepts
+  /memory <pat>          list percepts whose content matches <pat>
+  /memory show <pat|#id>  show full details of matching percepts
+  /forget <pat|#id>      delete a percept (asks for confirmation)
+  /panel memory          toggle the memory panel (right side) — also F1
+  /panel tasks           toggle the tasks panel (right side) — also F2
+  /panel background      toggle the background-agents panel (right side) — also F3
+  /panel workflow        toggle the workflow panel (right side) — also F4
+  /tasks                 list current session and global tasks
+  /task done <id>        mark a task done
+
+── Background agents ───────────────────────────────────────────────────
+  /bg                    list background agents (ID, status, label, elapsed)
+  /bg list               same as bare /bg
+  /bg start <task>       spawn a background agent to research <task>
+  /bg stop <id>          terminate a running background agent
+
+── Display ──────────────────────────────────────────────────────────────
+  /colorize              show current colorization mode
+  /colorize off          no colorization
+  /colorize fenced       highlight fenced code blocks only
+  /colorize balanced     fenced blocks + inline markdown (default)
+  /colorize full         full glamour markdown render (experimental)
+  /think                 show current reasoning visibility
+  /think on              show thinking/reasoning tokens inline
+  /think off             hide thinking tokens ([thinking…] placeholder)
+  /history               show current history navigation mode
+  /history global        navigate global input history
+  /history session       navigate session input history (default)
+
+── Observability ────────────────────────────────────────────────────────
+  /usage                 token usage report for this session and all-time totals
+  /metrics               show latest metric values
+  /otel                  show OTel file sizes and record counts
+  /otel on               enable OTel for this session
+  /otel off              disable OTel for this session
+  /otel trim             archive current OTel files and start fresh
+  /otel debug enable     enable full debug logging (log_context, debug_*, log_level=DEBUG)
+  /otel debug disable    disable debug logging (restores defaults)
+
+── MCP Servers ───────────────────────────────────────────────────────────
+  /mcp                   list configured MCP servers and their status
+  /mcp list [<agent>]    list MCP servers for an agent (default: primary)
+  /mcp add                add a new MCP server interactively
+  /mcp add name=… url=… [transport=http] [auth=…] [api_key=…] [timeout=…]
+  /mcp add name=… transport=stdio command=… [args=arg1,arg2,…]
+  /mcp remove <name>     remove an MCP server by name
+  /mcp enable <name>     enable a disabled MCP server
+  /mcp disable <name>    disable an MCP server (keeps config)
+  /mcp tools [<name>]    list tools exported by connected MCP server(s)
+  /mcp reconnect [<name>]  reset dead server(s) so they retry on next use
+  /mcp assign <server> for <agent>   add server to agent's mcp_servers list
+  /mcp unassign <server> for <agent>  remove server from agent's list
+  /mcp auth <name>       run OAuth authorization flow for an MCP server
+
+── Workflow ───────────────────────────────────────────────────────────────
+  /workflow                                          list available workflows
+  /workflow <name> [<task>] [--<role> <agent> ...]   start a registered workflow, e.g. dev (designer→generator→evaluator),
+                                                      pair (adds a user checkpoint before each verdict), swarm (concurrent
+                                                      items + a final pass) — or a custom one from ~/.milk/workflows/
+  /workflow resume                                   resume workflow from last checkpoint
+  /workflow reconfigure                              reassign agent roles for current workflow (preserves state)
+  /workflow clear                                    delete saved workflow state for this session
+
+── Direct bash ───────────────────────────────────────────────────────────
+  /bash list             list the auto-allow prefixes (no confirmation prompt)
+  /bash allow <prefix>   add a prefix to the auto-allow list and save config
+  /bash deny <prefix>    remove a prefix from the auto-allow list and save config
+
+── Server ────────────────────────────────────────────────────────────────
+  /server status [<agent>]          show server status (reachable + PID)
+  /server start for <agent>         start the inference server manually
+  /server stop [<agent>]            stop the server tracked for an agent
+
+── Setup ─────────────────────────────────────────────────────────────────
+  /config                print the current config (~/.milk/config.json)
+  /config init           run the setup wizard (configure primary + escalation agents)
+  /config open           open config in $EDITOR / system default editor
+  /reload                re-parse config.json immediately (same as the auto-watcher)
+  /open <file>           open any file in $EDITOR (agent can also call the open_file tool)
+  /setup telegram        configure Telegram remote oversight interactively
+  /setup telegram on     enable Telegram (credentials must already be configured)
+  /setup telegram off    disable Telegram (credentials are preserved)
+
+── Attachments ──────────────────────────────────────────────────────────
+  /attach <path>         stage a file or image for the next agent turn
+                         text files → quoted block in message body
+                         images (png/jpg/gif/webp) → multipart vision payload
+  /paste                 probe clipboard for binary content (image, PDF, …)
+                         auto-stages it as an attachment; requires xclip (X11)
+                         or wl-paste (Wayland); also fires on empty paste event
+
+── General ──────────────────────────────────────────────────────────────
+  /help                  show this help
+  /exit  /quit           quit
+
+── Keyboard ─────────────────────────────────────────────────────────────
+  Scrolling
+    Mouse wheel / PgUp/PgDn / Ctrl+U / Ctrl+F   scroll transcript
+
+  Agent control
+    Ctrl+C   interrupt current agent turn (or copy if selection is active)
+    Ctrl+T   toggle thinking/reasoning visibility (works during streaming)
+
+  Transcript selection
+    Mouse drag                    select by line+column
+    Shift+Arrow / Ctrl+Arrow      extend or reduce selection (when active)
+    Ctrl+Click                    extend selection to clicked position
+    Ctrl+C / right-click          copy selection to clipboard
+    Esc                           clear selection
+
+  Input history
+    Up / Down (single-line input)   navigate history
+    Ctrl+Up / Ctrl+Down             navigate history (or extend transcript selection when active)
+    Ctrl+R                          reverse incremental search
+    Ctrl+S                          forward incremental search
+
+  Multi-line input
+    Ctrl+N / Shift+Alt+Enter / Alt+Enter   insert newline
+    Paste                                  multi-line paste sent as one block
+
+  Panels
+    F1 / F2 / F3 / F4   show/hide the memory / tasks / background-agents / workflow
+                        panel — same as /panel <name>, works in any mode
+
+  Memory panel
+    Double-click entry   print memory entry details to transcript
+
+  @ prefix
+    @path   reference a file path (Tab-completes)`
+
+// renderHelp applies consistent ANSI styling to the interactiveHelp block:
+// section header lines (── … ──) are dimmed and padded to width columns,
+// command tokens are bolded. Pass width=0 to use a default of 80.
+func renderHelp(s string, width int) string {
+	if width <= 0 || width > 80 {
+		width = 80
+	}
+	var b strings.Builder
+	for _, line := range strings.Split(s, "\n") {
+		switch {
+		case strings.HasPrefix(line, "──"):
+			// Section header: rebuild trailing dashes to fit exactly width cols.
+			// "── Name ─…─" → prefix "── Name ", then fill with fresh dashes.
+			runes := []rune(line)
+			end := len(runes)
+			for end > 0 && runes[end-1] == '─' {
+				end--
+			}
+			prefix := string(runes[:end]) // e.g. "── Routing "
+			// All chars in prefix are ASCII (1 col) or '─' (1 col), so len(runes[:end]) == prefixCols.
+			fill := width - end
+			if fill < 1 {
+				fill = 1
+			}
+			b.WriteString(dim(prefix + strings.Repeat("─", fill)))
+		case len(line) >= 2 && line[0] == ' ' && line[1] == ' ':
+			// Command or detail line: style slash-command lines.
+			trimmed := strings.TrimLeft(line, " ")
+			if strings.HasPrefix(trimmed, "/") {
+				indent := line[:len(line)-len(trimmed)]
+				b.WriteString(indent)
+				// Emit the /command token in bold-gold.
+				rest := trimmed
+				sp := strings.IndexByte(rest, ' ')
+				if sp < 0 {
+					b.WriteString(boldYellow(rest))
+					b.WriteByte('\n')
+					continue
+				}
+				b.WriteString(boldYellow(rest[:sp]))
+				rest = rest[sp:] // leading space(s) + remainder
+				// Bold any immediately-following subcommand words (lowercase alpha only).
+				// Multiple leading spaces signal description-column padding — stop there.
+				for len(rest) > 0 && rest[0] == ' ' {
+					if len(rest) > 1 && rest[1] == ' ' {
+						break // padding gap, not a subcommand
+					}
+					next := rest[1:] // strip the single space
+					wordEnd := strings.IndexByte(next, ' ')
+					var word string
+					if wordEnd < 0 {
+						word = next
+					} else {
+						word = next[:wordEnd]
+					}
+					if isSubcmd(word) {
+						b.WriteByte(' ')
+						b.WriteString(bold(word))
+						if wordEnd < 0 {
+							rest = ""
+						} else {
+							rest = next[wordEnd:]
+						}
+					} else {
+						break
+					}
+				}
+				b.WriteString(rest)
+			} else {
+				b.WriteString(line)
+			}
+		default:
+			b.WriteString(line)
+		}
+		b.WriteByte('\n')
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// isSubcmd reports whether word is a bare subcommand token (lowercase letters only).
+// Used by renderHelp to decide which tokens after the /command get bold treatment.
+func isSubcmd(word string) bool {
+	if word == "" {
+		return false
+	}
+	for _, ch := range word {
+		if ch < 'a' || ch > 'z' {
+			return false
+		}
+	}
+	return true
+}
+
+const errFmt = "error: %v\n"
+
+// interactiveState holds mutable state for the interactive loop.
+type interactiveState struct {
+	sess          *session.Session
+	forceEscalate bool
+	forcePrimary  bool
+	// stickyEscalate is set when the user explicitly calls /escalate with no
+	// prompt. It causes every subsequent turn to route to the escalation agent
+	// until the user calls /primary or closes the session. forceEscalate is reset after each
+	// turn; stickyEscalate persists across turns. Shown as "(pinned)" in the status bar.
+	stickyEscalate bool
+	// autoStickyEscalate is set automatically when the router first escalates
+	// (without an explicit /escalate command) and cfg.StickyEscalationEnabled() is true.
+	// Cleared by /primary, Ctrl+C on empty input, or a forcePrimary turn.
+	// Shown as "(sticky)" in the status bar to distinguish it from user-pinned.
+	autoStickyEscalate bool
+	// stickyPrimary mirrors stickyEscalate for the local model.
+	stickyPrimary bool
+	cwd           string
+	cfg           config.Config
+	mem           *memory.Store
+	cs            *claudesettings.Store // Claude project settings (permissions persistence)
+	program       *tea.Program          // set after tea.NewProgram, before Run
+
+	// toolFutures caches per-tool answer channels created by OnToolUse as soon
+	// as each tool call is detected in the stream. The user is asked immediately
+	// via the TUI; handleStructuredDenials reads the answer (blocking briefly if
+	// the user hasn't responded yet). Keyed by tool name.
+	toolFutures     map[string]chan string
+	skipPermissions bool             // session-level override for DangerouslySkipPermissions
+	localPerms      *local.PermStore // persisted tool grants for the primary local agent
+	notifier        oversight.Notifier
+
+	// pendingRemoteInputs queues messages received from the remote oversight
+	// interface (e.g. Telegram) while a turn is in progress. Drained one at a
+	// time by handleAgentDone once the current turn completes.
+	pendingRemoteInputs []string
+
+	// lastEscalationContextHash is a short hash of the last per-turn context block
+	// prepended to a resumed CLI escalation prompt. Used to avoid appending the same
+	// block to the conversation twice in a row.
+	lastEscalationContextHash string
+
+	// pendingSessionContent overrides the user-turn content recorded in session history
+	// for the next dispatch. When non-empty, runPrimary/runEscalation use this string
+	// instead of the raw prompt. Reset to "" after each turn. Used to store compact
+	// attachment placeholders in history instead of full file content.
+	pendingSessionContent string
+
+	// pendingCLIImageFiles holds temp file paths for images staged for the CLI
+	// escalation path. Each file is prepended as @<path> in the prompt so the
+	// claude binary reads the image natively. Paths are removed after the turn.
+	pendingCLIImageFiles []string
+
+	// activeFallbackTarget is set by runTurn just before a turn runs when the
+	// router's decision was overridden by availability (e.g. local down → escalation).
+	// "" means no override is active. Used by agentLabel to show the correct agent
+	// during the turn without waiting for session state to update.
+	activeFallbackTarget string
+}
+
+// primaryAgentName returns the display name of the configured primary agent.
+func (st *interactiveState) primaryAgentName() string {
+	return st.cfg.ActiveAgent().Name
+}
+
+// escalationAgentName returns the display name of the configured escalation agent.
+func (st *interactiveState) escalationAgentName() string {
+	return st.cfg.EscalationAgentConfig().Name
+}
+
+// extractSlashCommand recognizes a known slash command only as the leading
+// token of the input — never mid-sentence or mid-paste — so mentioning a
+// command by name elsewhere in a prompt (typed or pasted) is inert text.
+// Returns the command, the remaining text with the token stripped, and
+// whether a command was found.
+func extractSlashCommand(input string) (cmd, rest string, found bool) {
+	words := strings.Fields(input)
+	if len(words) == 0 || !strings.HasPrefix(words[0], "/") || !slices.Contains(slashCommands, words[0]) {
+		return "", input, false
+	}
+	return words[0], strings.Join(words[1:], " "), true
+}
+
+// promptFriendly is the set of slash commands that can be combined with a prompt.
+var promptFriendly = map[string]bool{
+	cmdEscalate: true,
+	cmdPrimary:  true,
+	cmdLearn:    true,
+	cmdOtel:     true,
+}
+
+// busySafeCommands are slash commands that can run while an agent turn is in progress.
+// All are read-only or display-only and never dispatch a new agent turn
+// (except /bg start, which spawns a background job — the same thing Ctrl+Enter
+// already does while busy — and /bg stop, which is an interrupt-style action).
+var busySafeCommands = map[string]bool{
+	"/help":     true,
+	cmdThink:    true,
+	cmdColorize: true,
+	cmdPanel:    true,
+	cmdHistory:  true,
+	cmdMemory:   true,
+	cmdUsage:    true,
+	cmdMetrics:  true,
+	cmdExport:   true,
+	cmdPaste:    true,
+	cmdMCP:      true,
+	cmdBg:       true,
+}
+
+// handleSlashCommand processes a slash command with optional surrounding prompt text.
+// Returns (exit, prompt-to-dispatch, output): exit=true means quit the loop,
+// prompt is non-empty when the command should be followed by an immediate dispatch,
+// output is text to print via tea.Println.
+func handleSlashCommand(cmd, prompt string, st *interactiveState) (exit bool, dispatch, output string) {
+	switch cmd {
+	case "/exit", "/quit":
+		return true, "", ""
+	case "/help", "/new", "/drop", "/list", cmdPaste:
+		output = execNonPromptCmd(cmd, prompt, st)
+	case cmdLearn:
+		output = execLearn(prompt, st)
+	case cmdOtel:
+		output = execOtel(prompt, st)
+	case cmdMetrics:
+		output = execMetrics()
+	case cmdUsage:
+		output = execUsage(st)
+	case cmdMemory:
+		output = execMemory(prompt, st)
+	case cmdExport:
+		output = execExport(prompt, st)
+	case cmdEscalate:
+		st.forcePrimary = false
+		st.stickyPrimary = false
+		if prompt == "fresh" || strings.HasPrefix(prompt, "fresh ") {
+			// /escalate fresh [msg]: force ContextModeFirst on the next escalation turn,
+			// dropping the existing session ID and nonce so Claude starts with clean context.
+			rest := strings.TrimPrefix(strings.TrimPrefix(prompt, "fresh"), " ")
+			st.sess.ForceFreshEscalation = true
+			st.forceEscalate = rest != ""
+			if rest == "" {
+				st.stickyEscalate = true
+				output = milkTag() + " fresh escalation context — next turn starts a new " + blue(st.escalationAgentName()) + " session"
+			} else {
+				output = milkTag() + " fresh escalation context for this turn"
+			}
+			return false, rest, output
+		}
+		if prompt == "" {
+			// No inline prompt: pin all subsequent turns to escalation agent.
+			st.stickyEscalate = true
+			st.forceEscalate = false
+			output = milkTag() + " pinned to " + blue(st.escalationAgentName()) + " (use /primary to unpin)"
+		} else {
+			// Inline prompt: single-turn override only.
+			st.forceEscalate = true
+		}
+		return false, prompt, output
+	case cmdPrimary:
+		st.forceEscalate = false
+		st.stickyEscalate = false
+		st.autoStickyEscalate = false
+		if st.sess != nil {
+			// Use total user-turn count, not local-only: sessionToUnifiedMessages
+			// includes all user turns, so the skip window must match.
+			st.sess.RepetitionBaselineLocalTurns = st.sess.UserTurnCount()
+			// Reset ESCALATION_WAITING state when explicitly switching to primary.
+			if st.sess.State == session.StateEscalationWaiting {
+				st.sess.ForceState(session.StateRouting)
+			}
+		}
+		if prompt == "" {
+			// No inline prompt: pin all subsequent turns to local.
+			st.stickyPrimary = true
+			st.forcePrimary = false
+			output = milkTag() + " pinned to " + green(st.cfg.ActiveAgent().Name) + " (use /escalate to unpin)"
+		} else {
+			// Inline prompt: single-turn override only.
+			st.forcePrimary = true
+		}
+		return false, prompt, output
+	case cmdBash:
+		output = execBash(prompt, st)
+	case cmdSkipPerms:
+		output = execSkipPerms(prompt, st)
+	case cmdThink:
+		// execThink is handled in repl.go where it can toggle model.showThinking.
+		// This case is a no-op here; the TUI intercepts cmdThink before it reaches
+		// handleSlashCommand. Guard to prevent "unknown command" output.
+	case cmdSetup:
+		// Handled in repl.go (needs model state). No-op here.
+	case cmdConfig:
+		// Handled in repl.go (needs model state and config path). No-op here.
+	case cmdOpen:
+		// Handled in repl.go (needs tea.ExecProcess). No-op here.
+	case cmdAttach:
+		// Handled in commands.go (handleAttachCmd) where model state is available.
+	case cmdMCP:
+		// Handled in commands.go (handleMCPCmd) where model state is available for wizards.
+	case cmdUpdate:
+		// Handled in repl.go (needs model state for install dispatch). No-op here.
+	default:
+		output = fmt.Sprintf("unknown command %q — type /help", cmd)
+	}
+	return false, "", output
+}
+
+// execNonPromptCmd runs a command that has no prompt semantics.
+// Returns any output to be printed. Warns if the user included extra text.
+func execNonPromptCmd(cmd, prompt string, st *interactiveState) string {
+	var out strings.Builder
+	if prompt != "" && !promptFriendly[cmd] {
+		fmt.Fprintf(&out, "%s %s does not accept a prompt — text ignored\n", milkTag(), cmd)
+	}
+	switch cmd {
+	case "/help":
+		fmt.Fprint(&out, renderHelp(interactiveHelp, 0))
+	case "/new":
+		var err error
+		st.sess, err = session.New(st.cwd, "")
+		if err != nil {
+			fmt.Fprintf(&out, errFmt, err)
+			return out.String()
+		}
+		obs.ResetSessionTokens()
+		fmt.Fprintf(&out, "%s new session %s", milkTag(), st.sess.ID[:8])
+	case "/drop":
+		if err := dropAndNewSession(st, &out); err != nil {
+			fmt.Fprintf(&out, red("error: ")+"%v", err)
+		}
+	case "/list":
+		if err := listSessions(st.cwd, &out); err != nil {
+			fmt.Fprintf(&out, errFmt, err)
+		}
+	case cmdPaste:
+		fmt.Fprint(&out, milkTag()+" probing clipboard for non-text content (image, PDF, …)")
+	}
+	return out.String()
+}
+
+// execUsage prints token usage by agent role and model, plus current-session totals.
+func execUsage(st *interactiveState) string {
+	otelDir, err := config.OtelDir()
+	if err != nil {
+		return fmt.Sprintf("%s error: %v", milkTag(), err)
+	}
+	var sessEntries []obs.SessionTokenEntry
+	var turns int64
+	if st != nil && st.sess != nil {
+		for _, u := range st.sess.TokensSnapshot() {
+			sessEntries = append(sessEntries, obs.SessionTokenEntry{
+				Model: u.Model, Agent: u.Agent,
+				Prompt: u.Prompt, Completion: u.Completion,
+				CacheRead: u.CacheRead, CacheCreation: u.CacheCreation,
+			})
+		}
+		turns = int64(st.sess.EscalationTurnCount() + st.sess.LocalTurnCount())
+	}
+	return milkTag() + " " + obs.FormatTokenUsage(context.Background(), otelDir, sessEntries, turns)
+}
+
+// execMetrics prints the most recent metric values from the otel metrics file.
+func execMetrics() string {
+	otelDir, err := config.OtelDir()
+	if err != nil {
+		return fmt.Sprintf("%s error: %v", milkTag(), err)
+	}
+	return milkTag() + " " + obs.FormatMetrics(otelDir)
+}
+
+// execOtel handles /otel [trim|off|on] commands.
+func execOtel(sub string, st *interactiveState) string {
+	otelDir, err := config.OtelDir()
+	if err != nil {
+		return fmt.Sprintf("%s error: %v", milkTag(), err)
+	}
+	switch strings.TrimSpace(sub) {
+	case "trim":
+		if err := obs.Trim(otelDir); err != nil {
+			return fmt.Sprintf("%s trim failed: %v", milkTag(), err)
+		}
+		return milkTag() + " otel files archived — starting fresh"
+	case "off":
+		st.cfg.Otel.Enabled = false
+		return milkTag() + " OTel disabled for this session"
+	case "on":
+		st.cfg.Otel.Enabled = true
+		return milkTag() + " OTel re-enabled for this session"
+	case "debug enable":
+		if err := runOtelDebug(true); err != nil {
+			return fmt.Sprintf("%s error: %v", milkTag(), err)
+		}
+		st.cfg.Otel.LogContext = true
+		st.cfg.Otel.LogLevel = "DEBUG"
+		st.cfg.DebugCLILog = true
+		st.cfg.DebugLocalLog = true
+		st.cfg.DebugSubprocessLog = true
+		cliPath, _ := config.CLIDebugLogPath()
+		localPath, _ := config.LocalDebugLogPath()
+		subprocessPath, _ := config.SubprocessDebugLogPath()
+		return milkTag() + " debug logging enabled\n" +
+			"  claude NDJSON → " + cliPath + "\n" +
+			"  local SSE     → " + localPath + "\n" +
+			"  subprocess    → " + subprocessPath + "\n" +
+			"  payloads      → " + otelDir + "/logs.jsonl"
+	case "debug disable":
+		if err := runOtelDebug(false); err != nil {
+			return fmt.Sprintf("%s error: %v", milkTag(), err)
+		}
+		st.cfg.Otel.LogContext = false
+		st.cfg.Otel.LogLevel = "INFO" // in-memory reset; disk already restored by runOtelDebug
+		st.cfg.DebugCLILog = false
+		st.cfg.DebugLocalLog = false
+		st.cfg.DebugSubprocessLog = false
+		return milkTag() + " debug logging disabled"
+	default:
+		return milkTag() + " " + obs.FormatStats(otelDir)
+	}
+}
+
+// execExport dumps the current session as text or JSON, optionally to a file.
+// sub may be "json", a file path, or empty (text to stdout).
+func execExport(sub string, st *interactiveState) string {
+	sub = strings.TrimSpace(sub)
+	format := "text"
+	outputPath := ""
+	if sub == "json" {
+		format = "json"
+	} else if sub != "" {
+		outputPath = sub
+	}
+
+	var content string
+	switch format {
+	case "json":
+		data, err := session.ExportJSON(st.sess)
+		if err != nil {
+			return fmt.Sprintf("%s export error: %v", milkTag(), err)
+		}
+		content = string(data)
+	default:
+		if outputPath != "" {
+			content = session.ExportText(st.sess) // plain — no ANSI in files
+		} else {
+			content = session.ExportTextColorized(st.sess) // colorized for terminal
+		}
+	}
+
+	if outputPath != "" {
+		if err := os.WriteFile(outputPath, []byte(content), 0o644); err != nil {
+			return fmt.Sprintf("%s export error: %v", milkTag(), err)
+		}
+		return fmt.Sprintf("%s session exported to %s (%d bytes)", milkTag(), outputPath, len(content))
+	}
+	return content
+}
+
+// execMemory lists percepts from the memory store with optional filters.
+// sub may be "global", "session", or a free-form content pattern.
+func execMemory(sub string, st *interactiveState) string {
+	if st.mem == nil {
+		return milkTag() + " memory store not available"
+	}
+	sub = strings.TrimSpace(sub)
+
+	if sub == "show" {
+		return milkTag() + " usage: /memory show <description> or /memory show #<id>"
+	}
+	if rest, ok := strings.CutPrefix(sub, "show "); ok {
+		return execMemoryShow(strings.TrimSpace(rest), st)
+	}
+
+	opts := memory.ListOpts{}
+	switch sub {
+	case "global":
+		opts.Scope = "global"
+	case "session":
+		opts.Scope = "session"
+	default:
+		opts.Pattern = sub
+	}
+	percepts := st.mem.List(opts)
+	if len(percepts) == 0 {
+		return milkTag() + " (no percepts found)"
+	}
+	return milkTag() + "\n" + memory.FormatList(percepts)
+}
+
+func execMemoryShow(pat string, st *interactiveState) string {
+	var percepts []memory.Percept
+	if strings.HasPrefix(pat, "#") {
+		percepts = st.mem.FindByIDPrefix(pat[1:])
+	} else {
+		percepts = st.mem.List(memory.ListOpts{Pattern: pat})
+	}
+	if len(percepts) == 0 {
+		return milkTag() + " no percepts match " + fmt.Sprintf("%q", pat)
+	}
+	return milkTag() + "\n" + memory.FormatListVerbose(percepts)
+}
+
+// execLearn stores a user fact in the global memory store.
+func execLearn(fact string, st *interactiveState) string {
+	if strings.TrimSpace(fact) == "" {
+		return milkTag() + " usage: /learn <fact to remember>"
+	}
+	if st.mem == nil {
+		return milkTag() + " memory store not available"
+	}
+	id, err := st.mem.RecordGlobal(context.Background(), fact, memory.ProducerUser, memory.ConsumerAll, memory.Roles{})
+	if dup, ok := memory.IsDuplicate(err); ok {
+		return fmt.Sprintf("%s skipped — similar memory already exists (%.0f%% overlap): %q (#%s)",
+			milkTag(), dup.Similarity*100, dup.Existing.Content, id[:8])
+	}
+	if err != nil {
+		return fmt.Sprintf("%s error storing memory: %v", milkTag(), err)
+	}
+	return fmt.Sprintf("%s learned: %q (id %s)", milkTag(), fact, id[:8])
+}
+
+// execSkipPerms handles /skip-permissions [on|off].
+func execSkipPerms(sub string, st *interactiveState) string {
+	switch strings.TrimSpace(sub) {
+	case "on":
+		st.skipPermissions = true
+		return milkTag() + " " + red("dangerously_skip_permissions ON") + " — all agents will auto-approve tool uses"
+	case "off":
+		st.skipPermissions = false
+		return milkTag() + " dangerously_skip_permissions OFF — agents will prompt before running tools"
+	default:
+		state := "off"
+		if st.skipPermissions {
+			state = red("on")
+		}
+		return fmt.Sprintf("%s dangerously_skip_permissions is %s  (use /skip-permissions on|off)", milkTag(), state)
+	}
+}
+
+// execColorize handles /colorize [off|fenced|balanced|full].
+// With no arg: shows the current mode. With a valid mode: switches it live and saves to config.
+func execColorize(sub string, st *interactiveState) string {
+	sub = strings.TrimSpace(sub)
+	if sub == "" {
+		return fmt.Sprintf("%s colorization mode: %s  (off | fenced | balanced | full[experimental])", milkTag(), bold(string(ParseColorizeMode(st.cfg.Colorization))))
+	}
+	valid := map[string]bool{"off": true, "fenced": true, "balanced": true, "full": true}
+	if !valid[sub] {
+		return fmt.Sprintf("%s unknown mode %q — valid values: off, fenced, balanced, full (experimental)", milkTag(), sub)
+	}
+	st.cfg.Colorization = sub
+	if err := saveLocalOrGlobal(st.cfg); err != nil {
+		return fmt.Sprintf("%s set colorization to %s (config save failed: %v)", milkTag(), bold(sub), err)
+	}
+	return fmt.Sprintf("%s colorization set to %s", milkTag(), bold(sub))
+}
+
+// execAgent shows the active local-agent provider configuration (no credentials).
+// arg is the remainder after "/agent" — empty for status display.
+func execAgent(st *interactiveState) string {
+	return agentLine("primary", st.cfg.ActiveAgent()) + "\n" +
+		agentLine("escalation", st.cfg.EscalationAgentConfig())
+}
+
+// agentLine formats a single agent config summary line for /agent output.
+func agentLine(role string, ac config.AgentConfig) string {
+	provider := strings.ToLower(strings.TrimSpace(ac.Provider))
+	var authDesc string
+	switch provider {
+	case "", "local":
+		authDesc = "none (local / no-auth)"
+	case "claude-cli":
+		authDesc = "claude CLI subprocess"
+	case "bedrock":
+		region := ac.AWSRegion
+		if region == "" {
+			region = "(unset)"
+		}
+		service := ac.AWSService
+		if service == "" {
+			service = "bedrock"
+		}
+		authDesc = fmt.Sprintf("AWS SigV4 (region: %s, service: %s)", region, service)
+	default:
+		if ac.APIKey != "" {
+			authDesc = fmt.Sprintf("Bearer token (%s, key set)", provider)
+		} else {
+			authDesc = fmt.Sprintf("Bearer token (%s, key NOT set)", provider)
+		}
+	}
+
+	extraHeaders := len(ac.Headers)
+	var headerNote string
+	if extraHeaders > 0 {
+		headerNote = fmt.Sprintf(", %d extra header(s)", extraHeaders)
+	}
+
+	name := ac.Name
+	if name == "" {
+		name = role
+	}
+
+	if ac.IsCLI() {
+		return fmt.Sprintf("%s %s agent: %s\n  auth:   %s", milkTag(), role, bold(name), authDesc)
+	}
+	return fmt.Sprintf("%s %s agent: %s\n  url:    %s\n  model:  %s\n  auth:   %s%s",
+		milkTag(), role, bold(name), bold(ac.URL), bold(ac.Model), authDesc, headerNote)
+}
+
+// dropAndNewSession drops the current session, creates a fresh one, and writes output to w.
+func dropAndNewSession(st *interactiveState, w *strings.Builder) error {
+	id := st.sess.ID
+	if err := session.Drop(id, st.cwd); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "%s dropped session %s\n", milkTag(), id[:8])
+	var err error
+	st.sess, err = session.New(st.cwd, "")
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "%s new session %s", milkTag(), st.sess.ID[:8])
+	return nil
+}
+
+// listSessions writes the session list for cwd to w.
+func listSessions(cwd string, w *strings.Builder) error {
+	entries, err := session.List(cwd)
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		fmt.Fprint(w, "no sessions found")
+		return nil
+	}
+	for dir, list := range entries {
+		fmt.Fprintf(w, "%s\n", dir)
+		for _, e := range list {
+			name := e.Name
+			if name == "" {
+				name = "(unnamed)"
+			}
+			fmt.Fprintf(w, "  %s  %-20s  %s", e.ID[:8], name, e.LastUsed.Format("2006-01-02 15:04"))
+		}
+	}
+	return nil
+}
+
+func loadSession(cwd string, flagNew bool, flagSession string) (*session.Session, error) {
+	if flagNew {
+		return session.New(cwd, flagSession)
+	}
+	return session.Resume(cwd, flagSession)
+}
+
+// execAgentTool dispatches /agent tool <verb> [args] subcommands.
+func execAgentTool(sub string, st *interactiveState) string {
+	parts := strings.Fields(sub)
+	if len(parts) == 0 {
+		return execAgentToolList("", st)
+	}
+	verb := parts[0]
+	rest := strings.TrimSpace(strings.TrimPrefix(sub, verb))
+
+	// parse optional "for <agent>|global" suffix
+	scope, toolName := parseAgentToolScope(rest)
+
+	switch verb {
+	case "list":
+		// For list, the "tool name" is actually the scope argument.
+		listScope := toolName
+		if scope != "" {
+			listScope = scope
+		}
+		return execAgentToolList(listScope, st)
+	case "enable":
+		if toolName == "" {
+			return milkTag() + " usage: /agent tool enable <tool-agent> [for <agent>|global]"
+		}
+		return execAgentToolEnable(toolName, scope, st)
+	case "disable":
+		if toolName == "" {
+			return milkTag() + " usage: /agent tool disable <tool-agent> [for <agent>|global]"
+		}
+		return execAgentToolDisable(toolName, scope, st)
+	case "add":
+		if toolName == "" {
+			return milkTag() + " usage: /agent tool add <tool-agent> description=<desc> [for <agent>|global]"
+		}
+		return execAgentToolAdd(toolName, scope, rest, st)
+	case "remove":
+		if toolName == "" {
+			return milkTag() + " usage: /agent tool remove <tool-agent> [for <agent>|global]"
+		}
+		return execAgentToolRemove(toolName, scope, st)
+	default:
+		return milkTag() + " unknown subcommand: /agent tool " + verb + "\n  try: list, enable, disable, add, remove"
+	}
+}
+
+// parseAgentToolScope parses "<tool-name> [for <agent>|global]" and returns (scope, toolName).
+// scope is "" (default: active primary), "global", or an agent name.
+func parseAgentToolScope(s string) (scope, toolName string) {
+	if idx := strings.Index(s, " for "); idx >= 0 {
+		toolName = strings.TrimSpace(s[:idx])
+		scope = strings.TrimSpace(s[idx+5:])
+		return
+	}
+	toolName = strings.TrimSpace(s)
+	return
+}
+
+// execAgentToolList shows effective tool-agents for the given scope.
+// scope == "" → use the active primary agent; scope == "global" → global list only;
+// otherwise → EffectiveToolAgents for the named agent.
+func execAgentToolList(scope string, st *interactiveState) string {
+	var targetName string
+	switch scope {
+	case "", "primary":
+		targetName = st.cfg.ActiveAgent().Name
+	case "global":
+		// Show raw global list.
+		entries := st.cfg.AgentTools
+		if len(entries) == 0 {
+			return milkTag() + " no global tool-agents configured"
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "%s global tool-agents:\n", milkTag())
+		for _, e := range entries {
+			status := "enabled"
+			if !e.IsEnabled() {
+				status = "disabled"
+			}
+			desc := e.Description
+			if len(desc) > 55 {
+				desc = desc[:52] + "..."
+			}
+			fmt.Fprintf(&b, "  %-20s  %-8s  %-8s  %s\n", e.Agent, status, "global", desc)
+		}
+		return strings.TrimRight(b.String(), "\n")
+	default:
+		targetName = scope
+	}
+
+	entries := st.cfg.EffectiveToolAgents(targetName)
+	if len(entries) == 0 {
+		return fmt.Sprintf("%s no tool-agents configured for %q", milkTag(), targetName)
+	}
+
+	// Build lookup sets for scope badge computation.
+	globalNames := make(map[string]bool, len(st.cfg.AgentTools))
+	for _, e := range st.cfg.AgentTools {
+		globalNames[strings.ToLower(e.Agent)] = true
+	}
+	overrideNames := make(map[string]bool)
+	for _, ac := range st.cfg.Agents {
+		if strings.EqualFold(ac.Name, targetName) {
+			for _, te := range ac.Tools {
+				overrideNames[strings.ToLower(te.Agent)] = true
+			}
+			break
+		}
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s tool-agents for %q:\n", milkTag(), targetName)
+	for _, e := range entries {
+		status := "enabled"
+		if !e.IsEnabled() {
+			status = "disabled"
+		}
+		key := strings.ToLower(e.Agent)
+		scopeBadge := "global"
+		if overrideNames[key] && globalNames[key] {
+			scopeBadge = "override"
+		} else if overrideNames[key] {
+			scopeBadge = "local"
+		}
+		desc := e.Description
+		if len(desc) > 55 {
+			desc = desc[:52] + "..."
+		}
+		fmt.Fprintf(&b, "  %-20s  %-8s  %-8s  %s\n", e.Agent, status, scopeBadge, desc)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// execAgentToolEnable sets Enabled=true on a matching entry.
+func execAgentToolEnable(toolName, scope string, st *interactiveState) string {
+	t := true
+	if scope == "global" {
+		idx := findToolEntryIdx(st.cfg.AgentTools, toolName)
+		if idx < 0 {
+			return fmt.Sprintf("%s tool-agent %q not found in global list — use /agent tool add first", milkTag(), toolName)
+		}
+		st.cfg.AgentTools[idx].Enabled = &t
+	} else {
+		agentName := scope
+		if agentName == "" {
+			agentName = st.cfg.ActiveAgent().Name
+		}
+		acIdx := findAgentIdx(st.cfg, agentName)
+		if acIdx < 0 {
+			return fmt.Sprintf("%s agent %q not found", milkTag(), agentName)
+		}
+		idx := findToolEntryIdx(st.cfg.Agents[acIdx].Tools, toolName)
+		if idx < 0 {
+			// Check if it exists globally; if so, create a per-agent override.
+			gIdx := findToolEntryIdx(st.cfg.AgentTools, toolName)
+			if gIdx < 0 {
+				return fmt.Sprintf("%s tool-agent %q not found — use /agent tool add first", milkTag(), toolName)
+			}
+			entry := st.cfg.AgentTools[gIdx]
+			entry.Enabled = &t
+			st.cfg.Agents[acIdx].Tools = append(st.cfg.Agents[acIdx].Tools, entry)
+		} else {
+			st.cfg.Agents[acIdx].Tools[idx].Enabled = &t
+		}
+	}
+	if err := saveLocalOrGlobal(st.cfg); err != nil {
+		return fmt.Sprintf("%s enabled %q (config save failed: %v)", milkTag(), toolName, err)
+	}
+	return fmt.Sprintf("%s tool-agent %q enabled", milkTag(), toolName)
+}
+
+// execAgentToolDisable sets Enabled=false on a matching entry.
+func execAgentToolDisable(toolName, scope string, st *interactiveState) string {
+	f := false
+	if scope == "global" {
+		idx := findToolEntryIdx(st.cfg.AgentTools, toolName)
+		if idx < 0 {
+			return fmt.Sprintf("%s tool-agent %q not found in global list — use /agent tool add first", milkTag(), toolName)
+		}
+		st.cfg.AgentTools[idx].Enabled = &f
+	} else {
+		agentName := scope
+		if agentName == "" {
+			agentName = st.cfg.ActiveAgent().Name
+		}
+		acIdx := findAgentIdx(st.cfg, agentName)
+		if acIdx < 0 {
+			return fmt.Sprintf("%s agent %q not found", milkTag(), agentName)
+		}
+		idx := findToolEntryIdx(st.cfg.Agents[acIdx].Tools, toolName)
+		if idx < 0 {
+			// Check if it exists globally; create per-agent override that disables it.
+			gIdx := findToolEntryIdx(st.cfg.AgentTools, toolName)
+			if gIdx < 0 {
+				return fmt.Sprintf("%s tool-agent %q not found — use /agent tool add first", milkTag(), toolName)
+			}
+			entry := st.cfg.AgentTools[gIdx]
+			entry.Enabled = &f
+			st.cfg.Agents[acIdx].Tools = append(st.cfg.Agents[acIdx].Tools, entry)
+		} else {
+			st.cfg.Agents[acIdx].Tools[idx].Enabled = &f
+		}
+	}
+	if err := saveLocalOrGlobal(st.cfg); err != nil {
+		return fmt.Sprintf("%s disabled %q (config save failed: %v)", milkTag(), toolName, err)
+	}
+	return fmt.Sprintf("%s tool-agent %q disabled", milkTag(), toolName)
+}
+
+// execAgentToolAdd adds a new tool-agent entry to the target scope.
+// The rest argument still contains the full "toolName [description=...] [for ...]" text
+// so we can extract the description= field.
+func execAgentToolAdd(toolName, scope, rest string, st *interactiveState) string {
+	// Extract description= from rest.
+	desc := ""
+	if idx := strings.Index(rest, "description="); idx >= 0 {
+		after := rest[idx+len("description="):]
+		// strip any trailing " for ..." scope fragment.
+		if forIdx := strings.Index(after, " for "); forIdx >= 0 {
+			after = after[:forIdx]
+		}
+		desc = strings.TrimSpace(after)
+	}
+	if desc == "" {
+		return milkTag() + " usage: /agent tool add <tool-agent> description=<desc> [for <agent>|global]"
+	}
+
+	entry := config.AgentToolEntry{Agent: toolName, Description: desc}
+
+	if scope == "global" {
+		if findToolEntryIdx(st.cfg.AgentTools, toolName) >= 0 {
+			return fmt.Sprintf("%s tool-agent %q already exists in global list — use enable/disable to change its state", milkTag(), toolName)
+		}
+		st.cfg.AgentTools = append(st.cfg.AgentTools, entry)
+	} else {
+		agentName := scope
+		if agentName == "" {
+			agentName = st.cfg.ActiveAgent().Name
+		}
+		acIdx := findAgentIdx(st.cfg, agentName)
+		if acIdx < 0 {
+			return fmt.Sprintf("%s agent %q not found", milkTag(), agentName)
+		}
+		if findToolEntryIdx(st.cfg.Agents[acIdx].Tools, toolName) >= 0 {
+			return fmt.Sprintf("%s tool-agent %q already exists for agent %q", milkTag(), toolName, agentName)
+		}
+		st.cfg.Agents[acIdx].Tools = append(st.cfg.Agents[acIdx].Tools, entry)
+	}
+	if err := saveLocalOrGlobal(st.cfg); err != nil {
+		return fmt.Sprintf("%s added tool-agent %q (config save failed: %v)", milkTag(), toolName, err)
+	}
+	return fmt.Sprintf("%s tool-agent %q added", milkTag(), toolName)
+}
+
+// execAgentToolRemove removes a tool-agent entry from the target scope.
+func execAgentToolRemove(toolName, scope string, st *interactiveState) string {
+	if scope == "global" {
+		idx := findToolEntryIdx(st.cfg.AgentTools, toolName)
+		if idx < 0 {
+			return fmt.Sprintf("%s tool-agent %q not found in global list", milkTag(), toolName)
+		}
+		st.cfg.AgentTools = append(st.cfg.AgentTools[:idx], st.cfg.AgentTools[idx+1:]...)
+	} else {
+		agentName := scope
+		if agentName == "" {
+			agentName = st.cfg.ActiveAgent().Name
+		}
+		acIdx := findAgentIdx(st.cfg, agentName)
+		if acIdx < 0 {
+			return fmt.Sprintf("%s agent %q not found", milkTag(), agentName)
+		}
+		idx := findToolEntryIdx(st.cfg.Agents[acIdx].Tools, toolName)
+		if idx < 0 {
+			return fmt.Sprintf("%s tool-agent %q not found for agent %q", milkTag(), toolName, agentName)
+		}
+		st.cfg.Agents[acIdx].Tools = append(st.cfg.Agents[acIdx].Tools[:idx], st.cfg.Agents[acIdx].Tools[idx+1:]...)
+	}
+	if err := saveLocalOrGlobal(st.cfg); err != nil {
+		return fmt.Sprintf("%s removed tool-agent %q (config save failed: %v)", milkTag(), toolName, err)
+	}
+	return fmt.Sprintf("%s tool-agent %q removed", milkTag(), toolName)
+}
+
+// findToolEntryIdx returns the index of a tool entry by agent name in a slice,
+// or -1 if not found. Comparison is case-insensitive.
+func findToolEntryIdx(entries []config.AgentToolEntry, agentName string) int {
+	lower := strings.ToLower(agentName)
+	for i, e := range entries {
+		if strings.ToLower(e.Agent) == lower {
+			return i
+		}
+	}
+	return -1
+}
+
+// findAgentIdx returns the index of an agent by name in cfg.Agents, or -1.
+func findAgentIdx(cfg config.Config, agentName string) int {
+	lower := strings.ToLower(agentName)
+	for i, ac := range cfg.Agents {
+		if strings.ToLower(ac.Name) == lower {
+			return i
+		}
+	}
+	return -1
+}
+
+// execMCP dispatches /mcp <verb> [args] subcommands.
+// toolSets is the live runtime map of agent-name → *mcp.ToolSet; may be nil.
+func execMCP(sub string, st *interactiveState, toolSets map[string]*mcp.ToolSet) string {
+	parts := strings.Fields(sub)
+	if len(parts) == 0 {
+		return execMCPList("", st, toolSets)
+	}
+	verb := parts[0]
+	rest := strings.TrimSpace(strings.TrimPrefix(sub, verb))
+
+	switch verb {
+	case "list":
+		return execMCPList(rest, st, toolSets)
+	case "add":
+		return execMCPAdd(rest, st)
+	case "remove":
+		if rest == "" {
+			return milkTag() + " usage: /mcp remove <name>"
+		}
+		return execMCPRemove(rest, st)
+	case "enable":
+		if rest == "" {
+			return milkTag() + " usage: /mcp enable <name>"
+		}
+		return execMCPSetEnabled(rest, true, st)
+	case "disable":
+		if rest == "" {
+			return milkTag() + " usage: /mcp disable <name>"
+		}
+		return execMCPSetEnabled(rest, false, st)
+	case "tools":
+		return execMCPTools(rest, st)
+	case "assign":
+		return execMCPAssign(rest, true, st)
+	case "unassign":
+		return execMCPAssign(rest, false, st)
+	case "reconnect":
+		return execMCPReconnect(rest, st, toolSets)
+	case "auth":
+		// /mcp auth is handled in handleMCPCmd (needs the bubbletea program
+		// handle to stream status updates back while it runs in the background).
+		return milkTag() + " usage: /mcp auth <server-name>  (run this in the TUI)"
+	default:
+		return milkTag() + " unknown subcommand: /mcp " + verb + "\n  try: list, add, remove, enable, disable, tools, assign, unassign, reconnect, auth"
+	}
+}
+
+// execMCPList shows the configured MCP servers, optionally filtered to those
+// visible by a given agent. When agentFilter is empty, shows all servers.
+// toolSets is the live runtime map of agent-name → *mcp.ToolSet; may be nil.
+func execMCPList(agentFilter string, st *interactiveState, toolSets map[string]*mcp.ToolSet) string {
+	agentFilter = strings.TrimSpace(agentFilter)
+	servers := st.cfg.MCPServers
+	if len(servers) == 0 {
+		return milkTag() + " no MCP servers configured — use /mcp add name=… url=… to add one"
+	}
+
+	// Build a lookup of which agents use which servers.
+	agentForServer := map[string][]string{}
+	for _, ac := range st.cfg.Agents {
+		for _, sname := range ac.MCPServers {
+			agentForServer[strings.ToLower(sname)] = append(agentForServer[strings.ToLower(sname)], ac.Name)
+		}
+	}
+
+	var b strings.Builder
+	if agentFilter != "" {
+		effective := st.cfg.EffectiveMCPServers(agentFilter)
+		if len(effective) == 0 {
+			return fmt.Sprintf("%s no MCP servers configured for agent %q", milkTag(), agentFilter)
+		}
+		fmt.Fprintf(&b, "%s MCP servers for %q:\n", milkTag(), agentFilter)
+		for _, s := range effective {
+			writeMCPServerLine(&b, s, agentForServer, toolSets)
+		}
+	} else {
+		fmt.Fprintf(&b, "%s MCP servers (%d):\n", milkTag(), len(servers))
+		for _, s := range servers {
+			writeMCPServerLine(&b, s, agentForServer, toolSets)
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// runtimeMCPStatus returns the runtime ConnectionStatus for serverName by
+// checking all toolsets. Returns StatusDisconnected when toolSets is nil or
+// the server is not in any active toolset.
+func runtimeMCPStatus(serverName string, toolSets map[string]*mcp.ToolSet) mcp.ConnectionStatus {
+	for _, ts := range toolSets {
+		if s := ts.ServerStatus(serverName); s != mcp.StatusDisconnected {
+			return s
+		}
+	}
+	return mcp.StatusDisconnected
+}
+
+// runtimeMCPRetryIn returns how long until the named server's backoff expires,
+// or 0 when the server is not backed off.
+func runtimeMCPRetryIn(serverName string, toolSets map[string]*mcp.ToolSet) time.Duration {
+	for _, ts := range toolSets {
+		for _, c := range ts.Clients() {
+			if strings.EqualFold(c.ServerName(), serverName) {
+				until := c.DeadUntil()
+				if until.IsZero() {
+					return 0
+				}
+				remaining := time.Until(until)
+				if remaining < 0 {
+					return 0
+				}
+				return remaining
+			}
+		}
+	}
+	return 0
+}
+
+func writeMCPServerLine(b *strings.Builder, s config.MCPServerConfig, agentForServer map[string][]string, toolSets map[string]*mcp.ToolSet) {
+	var connStatus string
+	if toolSets != nil {
+		switch runtimeMCPStatus(s.Name, toolSets) {
+		case mcp.StatusConnected:
+			connStatus = "  " + green("●")
+		case mcp.StatusDead:
+			retryIn := runtimeMCPRetryIn(s.Name, toolSets)
+			if retryIn > 0 {
+				connStatus = "  " + red(fmt.Sprintf("✖ retry in %ds", int(retryIn.Seconds())))
+			} else {
+				connStatus = "  " + red("✖ backed off")
+			}
+		default:
+			connStatus = "  " + dim("○")
+		}
+	}
+	cfgStatus := ""
+	if !s.IsEnabled() {
+		cfgStatus = "  " + dim("disabled")
+	}
+	auth := s.Auth
+	if auth == "" {
+		auth = "none"
+	}
+	agents := agentForServer[strings.ToLower(s.Name)]
+	agentBadge := ""
+	if len(agents) > 0 {
+		agentBadge = "  [" + strings.Join(agents, ", ") + "]"
+	}
+	endpoint := s.URL
+	if strings.ToLower(s.Transport) == "stdio" {
+		endpoint = s.Command
+		if len(s.Args) > 0 {
+			endpoint += " " + strings.Join(s.Args, " ")
+		}
+	}
+	fmt.Fprintf(b, "  %-20s  %-8s  %s%s%s%s\n", bold(s.Name), auth, endpoint, agentBadge, connStatus, cfgStatus)
+}
+
+// execMCPReconnect resets the dead flag on named server(s) so they will
+// attempt a lazy reconnect on next use. With no argument, resets all dead servers.
+func execMCPReconnect(name string, _ *interactiveState, toolSets map[string]*mcp.ToolSet) string {
+	if len(toolSets) == 0 {
+		return milkTag() + " no live MCP connections to reconnect (start milk with an agent that has mcp_servers configured)"
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		// Reset all dead clients across all toolsets.
+		count := 0
+		for _, ts := range toolSets {
+			for _, c := range ts.Clients() {
+				if c.Status() == mcp.StatusDead {
+					c.Reset()
+					count++
+				}
+			}
+		}
+		if count == 0 {
+			return milkTag() + " no dead MCP servers to reconnect"
+		}
+		return fmt.Sprintf("%s reset %d dead MCP server(s) — they will reconnect on next use", milkTag(), count)
+	}
+	// Reset a specific server by name.
+	found := false
+	for _, ts := range toolSets {
+		if ts.ResetServer(name) {
+			found = true
+		}
+	}
+	if !found {
+		return fmt.Sprintf("%s MCP server %q not found in any active toolset", milkTag(), name)
+	}
+	return fmt.Sprintf("%s MCP server %q reset — will reconnect on next use", milkTag(), name)
+}
+
+// execMCPAdd adds a new MCP server entry from key=value args.
+func execMCPAdd(rest string, st *interactiveState) string {
+	fields := parseKVArgs(rest)
+	name := fields["name"]
+	url := fields["url"]
+	if name == "" || url == "" {
+		return milkTag() + " usage: /mcp add name=<name> url=<url> [transport=http|sse] [auth=bearer|token_cmd] [api_key=…] [timeout=30s]"
+	}
+	entry := config.MCPServerConfig{
+		Name:      name,
+		URL:       url,
+		Transport: fields["transport"],
+		Auth:      fields["auth"],
+		APIKey:    fields["api_key"],
+		TokenCmd:  fields["token_cmd"],
+		Timeout:   fields["timeout"],
+	}
+	updated := config.UpsertMCPServer(&st.cfg, entry)
+	if err := saveLocalOrGlobal(st.cfg); err != nil {
+		return fmt.Sprintf("%s added MCP server %q (config save failed: %v)", milkTag(), name, err)
+	}
+	verb := "added"
+	if updated {
+		verb = "updated"
+	}
+	return fmt.Sprintf("%s MCP server %q %s — use /mcp assign %s for <agent> to expose it", milkTag(), name, verb, name)
+}
+
+// removeMCPServer removes serverName from cfg.MCPServers and cleans up every
+// agent's mcp_servers reference to it. Returns false (cfg left unchanged)
+// when no matching server was found. Shared by /mcp remove and the headless
+// "milk config mcp remove" CLI subcommand.
+func removeMCPServer(cfg *config.Config, serverName string) bool {
+	idx := findMCPServerIdx(cfg.MCPServers, serverName)
+	if idx < 0 {
+		return false
+	}
+	cfg.MCPServers = append(cfg.MCPServers[:idx], cfg.MCPServers[idx+1:]...)
+	lower := strings.ToLower(serverName)
+	for i, ac := range cfg.Agents {
+		var kept []string
+		for _, sname := range ac.MCPServers {
+			if strings.ToLower(sname) != lower {
+				kept = append(kept, sname)
+			}
+		}
+		cfg.Agents[i].MCPServers = kept
+	}
+	return true
+}
+
+// execMCPRemove removes an MCP server by name, also cleaning up all agent references.
+func execMCPRemove(name string, st *interactiveState) string {
+	if !removeMCPServer(&st.cfg, name) {
+		return fmt.Sprintf("%s MCP server %q not found", milkTag(), name)
+	}
+	if err := saveLocalOrGlobal(st.cfg); err != nil {
+		return fmt.Sprintf("%s removed MCP server %q (config save failed: %v)", milkTag(), name, err)
+	}
+	return fmt.Sprintf("%s MCP server %q removed", milkTag(), name)
+}
+
+// execMCPSetEnabled enables or disables an MCP server.
+func execMCPSetEnabled(name string, enabled bool, st *interactiveState) string {
+	idx := findMCPServerIdx(st.cfg.MCPServers, name)
+	if idx < 0 {
+		return fmt.Sprintf("%s MCP server %q not found", milkTag(), name)
+	}
+	st.cfg.MCPServers[idx].Enabled = &enabled
+	verb := "enabled"
+	if !enabled {
+		verb = "disabled"
+	}
+	if err := saveLocalOrGlobal(st.cfg); err != nil {
+		return fmt.Sprintf("%s %s MCP server %q (config save failed: %v)", milkTag(), verb, name, err)
+	}
+	return fmt.Sprintf("%s MCP server %q %s", milkTag(), name, verb)
+}
+
+// execMCPTools connects to the named server (or all servers for the primary agent)
+// and lists their available tools.
+func execMCPTools(serverName string, st *interactiveState) string {
+	serverName = strings.TrimSpace(serverName)
+	var servers []config.MCPServerConfig
+	if serverName != "" {
+		idx := findMCPServerIdx(st.cfg.MCPServers, serverName)
+		if idx < 0 {
+			return fmt.Sprintf("%s MCP server %q not found", milkTag(), serverName)
+		}
+		if !st.cfg.MCPServers[idx].IsEnabled() {
+			return fmt.Sprintf("%s MCP server %q is disabled", milkTag(), serverName)
+		}
+		servers = []config.MCPServerConfig{st.cfg.MCPServers[idx]}
+	} else {
+		servers = st.cfg.EffectiveMCPServers(st.cfg.ActiveAgent().Name)
+		if len(servers) == 0 {
+			return milkTag() + " no MCP servers configured for primary agent — specify a server name or use /mcp list"
+		}
+	}
+
+	var b strings.Builder
+	ctx := context.Background()
+	for _, s := range servers {
+		fmt.Fprintf(&b, "%s %s tools:\n", milkTag(), bold(s.Name))
+		c := mcpClientForConfig(s)
+		if err := c.Connect(ctx); err != nil {
+			fmt.Fprintf(&b, "  error: %v\n", err)
+			continue
+		}
+		defer c.Close(ctx)
+		tools := c.Tools()
+		if len(tools) == 0 {
+			fmt.Fprintf(&b, "  (no tools)\n")
+			continue
+		}
+		for _, t := range tools {
+			desc := t.Description
+			if len(desc) > 60 {
+				desc = desc[:57] + "..."
+			}
+			fmt.Fprintf(&b, "  %-30s  %s\n", t.Name, desc)
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// mcpAssignOutcome describes the result of assignMCPServer.
+type mcpAssignOutcome int
+
+const (
+	mcpAssignOK   mcpAssignOutcome = iota
+	mcpAssignNoop                  // already assigned (assign) / not assigned (unassign) — nothing to do
+	mcpAssignServerNotFound
+	mcpAssignAgentNotFound
+)
+
+// assignMCPServer adds or removes serverName from agentName's mcp_servers
+// list in cfg. Shared by the TUI's /mcp assign|unassign and the headless
+// "milk config mcp assign|unassign" CLI subcommand — callers format their
+// own success/error messaging around the returned outcome.
+func assignMCPServer(cfg *config.Config, serverName, agentName string, assign bool) mcpAssignOutcome {
+	if findMCPServerIdx(cfg.MCPServers, serverName) < 0 {
+		return mcpAssignServerNotFound
+	}
+	acIdx := findAgentIdx(*cfg, agentName)
+	if acIdx < 0 {
+		return mcpAssignAgentNotFound
+	}
+	lower := strings.ToLower(serverName)
+	existing := cfg.Agents[acIdx].MCPServers
+	if assign {
+		for _, sn := range existing {
+			if strings.ToLower(sn) == lower {
+				return mcpAssignNoop
+			}
+		}
+		cfg.Agents[acIdx].MCPServers = append(existing, serverName)
+		return mcpAssignOK
+	}
+	var kept []string
+	found := false
+	for _, sn := range existing {
+		if strings.ToLower(sn) == lower {
+			found = true
+		} else {
+			kept = append(kept, sn)
+		}
+	}
+	if !found {
+		return mcpAssignNoop
+	}
+	cfg.Agents[acIdx].MCPServers = kept
+	return mcpAssignOK
+}
+
+// execMCPAssign adds or removes an MCP server reference from an agent's mcp_servers list.
+// rest is "<server-name> for <agent-name>".
+func execMCPAssign(rest string, assign bool, st *interactiveState) string {
+	verb := "assign"
+	if !assign {
+		verb = "unassign"
+	}
+	serverName, agentName, ok := parseMCPAssignArgs(rest)
+	if !ok {
+		return fmt.Sprintf("%s usage: /mcp %s <server> for <agent>", milkTag(), verb)
+	}
+	switch assignMCPServer(&st.cfg, serverName, agentName, assign) {
+	case mcpAssignServerNotFound:
+		return fmt.Sprintf("%s MCP server %q not found — add it first with /mcp add", milkTag(), serverName)
+	case mcpAssignAgentNotFound:
+		return fmt.Sprintf("%s agent %q not found", milkTag(), agentName)
+	case mcpAssignNoop:
+		if assign {
+			return fmt.Sprintf("%s MCP server %q already assigned to agent %q", milkTag(), serverName, agentName)
+		}
+		return fmt.Sprintf("%s MCP server %q not assigned to agent %q", milkTag(), serverName, agentName)
+	}
+	if err := saveLocalOrGlobal(st.cfg); err != nil {
+		return fmt.Sprintf("%s %sed %q for agent %q (config save failed: %v)", milkTag(), verb, serverName, agentName, err)
+	}
+	if assign {
+		return fmt.Sprintf("%s MCP server %q assigned to agent %q", milkTag(), serverName, agentName)
+	}
+	return fmt.Sprintf("%s MCP server %q unassigned from agent %q", milkTag(), serverName, agentName)
+}
+
+// parseMCPAssignArgs parses "<server> for <agent>" from the rest string.
+func parseMCPAssignArgs(rest string) (serverName, agentName string, ok bool) {
+	idx := strings.Index(rest, " for ")
+	if idx < 0 {
+		return "", "", false
+	}
+	serverName = strings.TrimSpace(rest[:idx])
+	agentName = strings.TrimSpace(rest[idx+5:])
+	return serverName, agentName, serverName != "" && agentName != ""
+}
+
+// mcpClientForConfig builds an mcp.Client from an MCPServerConfig.
+func mcpClientForConfig(s config.MCPServerConfig) *mcp.Client {
+	return mcp.New(s)
+}
+
+// findMCPServerIdx returns the index of an MCP server by name, or -1.
+func findMCPServerIdx(servers []config.MCPServerConfig, name string) int {
+	lower := strings.ToLower(name)
+	for i, s := range servers {
+		if strings.ToLower(s.Name) == lower {
+			return i
+		}
+	}
+	return -1
+}
+
+// parseKVArgs parses "key=value key2=value2 …" into a map. Values may be
+// quoted with double quotes. Unrecognised tokens (no "=") are skipped.
+func parseKVArgs(s string) map[string]string {
+	result := map[string]string{}
+	for len(s) > 0 {
+		s = strings.TrimLeft(s, " \t")
+		if s == "" {
+			break
+		}
+		eq := strings.IndexByte(s, '=')
+		if eq < 0 {
+			break
+		}
+		key := strings.TrimSpace(s[:eq])
+		s = s[eq+1:]
+		var val string
+		if len(s) > 0 && s[0] == '"' {
+			// Quoted value: scan to closing quote.
+			end := strings.IndexByte(s[1:], '"')
+			if end < 0 {
+				val = s[1:]
+				s = ""
+			} else {
+				val = s[1 : end+1]
+				s = s[end+2:]
+			}
+		} else {
+			// Unquoted: read until next whitespace.
+			sp := strings.IndexAny(s, " \t")
+			if sp < 0 {
+				val = s
+				s = ""
+			} else {
+				val = s[:sp]
+				s = s[sp:]
+			}
+		}
+		if key != "" {
+			result[key] = val
+		}
+	}
+	return result
+}
+
+// splitCommaNames splits a comma-separated string into trimmed, non-empty names.
+func splitCommaNames(s string) []string {
+	var result []string
+	for _, part := range strings.Split(s, ",") {
+		name := strings.TrimSpace(part)
+		if name != "" {
+			result = append(result, name)
+		}
+	}
+	return result
+}

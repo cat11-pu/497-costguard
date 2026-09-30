@@ -1,0 +1,2323 @@
+package config
+
+import (
+	"crypto/md5"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/scoutme/milk/internal/loop"
+	"github.com/scoutme/milk/internal/modelsdev"
+)
+
+// LocalConfigDir is the name of the per-project config directory relative to cwd.
+// When present, its config.json is deep-merged over the global config.
+const LocalConfigDir = ".milk"
+
+// LocalConfigPath returns the absolute path to the local config file
+// (.milk/config.json relative to the current working directory), or an
+// error if cwd cannot be determined. The path is returned regardless of
+// whether the file exists — callers should os.Stat it.
+func LocalConfigPath() (string, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("resolving cwd for local config: %w", err)
+	}
+	return filepath.Join(cwd, LocalConfigDir, "config.json"), nil
+}
+
+// HasLocalConfig reports whether a local config file exists in the current
+// working directory. Used to decide whether to show the scope prompt.
+func HasLocalConfig() bool {
+	p, err := LocalConfigPath()
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(p)
+	return err == nil
+}
+
+// SaveLocal writes the given Config as the local (.milk/config.json) config
+// file, creating the directory if needed. Unlike Save(), this does NOT write
+// the backup — local configs are project-scoped and don't need the global
+// recovery mechanism.
+func SaveLocal(cfg Config) error {
+	p, err := LocalConfigPath()
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(p, data, 0o600)
+}
+
+// DeepMerge merges src into dst using the following rules:
+//   - Scalar fields in src overwrite dst when non-zero (int != 0, string != "", bool == true)
+//   - Pointer fields in src overwrite dst when non-nil
+//   - Slice fields in src replace dst entirely (except MCPServers and Agents which merge by name)
+//   - Nested structs are merged recursively
+//
+// The merge is applied in-place to dst and dst is returned.
+func DeepMerge(dst, src Config) Config {
+	// Scalar overrides
+	if src.Agent != "" {
+		dst.Agent = src.Agent
+	}
+	if src.EscalationAgent != "" {
+		dst.EscalationAgent = src.EscalationAgent
+	}
+	if src.DefaultRoute != "" {
+		dst.DefaultRoute = src.DefaultRoute
+	}
+	if src.Colorization != "" {
+		dst.Colorization = src.Colorization
+	}
+	if src.ContextBudgetChars != 0 {
+		dst.ContextBudgetChars = src.ContextBudgetChars
+	}
+	if src.MemoryReinjectionTurns != 0 {
+		dst.MemoryReinjectionTurns = src.MemoryReinjectionTurns
+	}
+	if src.MemoryReinjectionBytes != 0 {
+		dst.MemoryReinjectionBytes = src.MemoryReinjectionBytes
+	}
+	if src.PerceptInjectMax != 0 {
+		dst.PerceptInjectMax = src.PerceptInjectMax
+	}
+	if src.PerceptInjectMaxBytes != 0 {
+		dst.PerceptInjectMaxBytes = src.PerceptInjectMaxBytes
+	}
+	if src.PerceptStoreMax != 0 {
+		dst.PerceptStoreMax = src.PerceptStoreMax
+	}
+	if src.LocalMemoryResultMaxBytes != 0 {
+		dst.LocalMemoryResultMaxBytes = src.LocalMemoryResultMaxBytes
+	}
+	if src.LocalToolResultMaxBytes != 0 {
+		dst.LocalToolResultMaxBytes = src.LocalToolResultMaxBytes
+	}
+	if src.LocalMemoryReinjectionTurns != 0 {
+		dst.LocalMemoryReinjectionTurns = src.LocalMemoryReinjectionTurns
+	}
+	if src.LocalMemoryReinjectionBytes != 0 {
+		dst.LocalMemoryReinjectionBytes = src.LocalMemoryReinjectionBytes
+	}
+	if src.LocalContextBudgetChars != 0 {
+		dst.LocalContextBudgetChars = src.LocalContextBudgetChars
+	}
+	if src.LocalMaxToolIterations != 0 {
+		dst.LocalMaxToolIterations = src.LocalMaxToolIterations
+	}
+	if src.ReturningFreshStartLocalTurns != 0 {
+		dst.ReturningFreshStartLocalTurns = src.ReturningFreshStartLocalTurns
+	}
+	if src.NeedExpiryHours != 0 {
+		dst.NeedExpiryHours = src.NeedExpiryHours
+	}
+	if src.MaxBackgroundAgents != 0 {
+		dst.MaxBackgroundAgents = src.MaxBackgroundAgents
+	}
+	if src.BackgroundAgentTimeoutMinutes != 0 {
+		dst.BackgroundAgentTimeoutMinutes = src.BackgroundAgentTimeoutMinutes
+	}
+
+	// Bool overrides (true = override)
+	if src.DebugCLILog {
+		dst.DebugCLILog = true
+	}
+	if src.DebugLocalLog {
+		dst.DebugLocalLog = true
+	}
+	if src.DebugSubprocessLog {
+		dst.DebugSubprocessLog = true
+	}
+	if src.AWSAuthRefresh {
+		dst.AWSAuthRefresh = true
+	}
+	if src.ExperimentalPermissionManagement {
+		dst.ExperimentalPermissionManagement = true
+	}
+	if src.ExperimentalLazyHistoryManagement {
+		dst.ExperimentalLazyHistoryManagement = true
+	}
+	if src.DirectBash {
+		dst.DirectBash = true
+	}
+
+	// Pointer overrides
+	if src.ShowReasoning != nil {
+		dst.ShowReasoning = src.ShowReasoning
+	}
+	if src.StickyEscalation != nil {
+		dst.StickyEscalation = src.StickyEscalation
+	}
+	if src.PerceptRelevanceGate != nil {
+		dst.PerceptRelevanceGate = src.PerceptRelevanceGate
+	}
+	if src.UpdateCheck != nil {
+		dst.UpdateCheck = src.UpdateCheck
+	}
+	if src.UpdateChannel != "" {
+		dst.UpdateChannel = src.UpdateChannel
+	}
+	if src.UpdateSkippedVersion != "" {
+		dst.UpdateSkippedVersion = src.UpdateSkippedVersion
+	}
+	if src.UpdateLastCheck != "" {
+		dst.UpdateLastCheck = src.UpdateLastCheck
+	}
+
+	// Slice overrides (replace when non-nil)
+	if src.ConfigEditors != nil {
+		dst.ConfigEditors = src.ConfigEditors
+	}
+	if src.DirectBashAllow != nil {
+		dst.DirectBashAllow = src.DirectBashAllow
+	}
+	if src.ShellBinaries != nil {
+		dst.ShellBinaries = src.ShellBinaries
+	}
+	if src.AgentTools != nil {
+		dst.AgentTools = src.AgentTools
+	}
+
+	// Rules — deep merge sub-struct
+	dst.Rules = mergeRules(dst.Rules, src.Rules)
+
+	// Otel — deep merge sub-struct
+	dst.Otel = mergeOtel(dst.Otel, src.Otel)
+
+	// LoopDetection — pointer sub-struct override
+	if src.LoopDetection != nil {
+		dst.LoopDetection = src.LoopDetection
+	}
+
+	// RemoteOversight — pointer sub-struct override
+	if src.RemoteOversight != nil {
+		dst.RemoteOversight = src.RemoteOversight
+	}
+
+	// MCPServers — merge by name
+	if src.MCPServers != nil {
+		dst.MCPServers = mergeMCPServers(dst.MCPServers, src.MCPServers)
+	}
+
+	// Agents — merge by name
+	if src.Agents != nil {
+		dst.Agents = mergeAgents(dst.Agents, src.Agents)
+	}
+
+	return dst
+}
+
+func mergeRules(dst, src Rules) Rules {
+	if src.EscalateAboveTokens != 0 {
+		dst.EscalateAboveTokens = src.EscalateAboveTokens
+	}
+	if src.LocalBelowTokens != 0 {
+		dst.LocalBelowTokens = src.LocalBelowTokens
+	}
+	if src.EscalateThreshold != 0 {
+		dst.EscalateThreshold = src.EscalateThreshold
+	}
+	if src.LocalThreshold != 0 {
+		dst.LocalThreshold = src.LocalThreshold
+	}
+	if src.LocalVerbWeight != 0 {
+		dst.LocalVerbWeight = src.LocalVerbWeight
+	}
+	if src.EscalateVerbWeight != 0 {
+		dst.EscalateVerbWeight = src.EscalateVerbWeight
+	}
+	if src.PathRefWeight != 0 {
+		dst.PathRefWeight = src.PathRefWeight
+	}
+	if src.CodeBlockWeight != 0 {
+		dst.CodeBlockWeight = src.CodeBlockWeight
+	}
+	if src.OpenQuestionWeight != 0 {
+		dst.OpenQuestionWeight = src.OpenQuestionWeight
+	}
+	if src.ClassifierFallback != "" {
+		dst.ClassifierFallback = src.ClassifierFallback
+	}
+	if src.EscalateKeywords != nil {
+		dst.EscalateKeywords = src.EscalateKeywords
+	}
+	if src.LocalVerbs != nil {
+		dst.LocalVerbs = src.LocalVerbs
+	}
+	if src.EscalateVerbs != nil {
+		dst.EscalateVerbs = src.EscalateVerbs
+	}
+	if src.OpenQuestionPrefixes != nil {
+		dst.OpenQuestionPrefixes = src.OpenQuestionPrefixes
+	}
+	return dst
+}
+
+func mergeOtel(dst, src OtelConfig) OtelConfig {
+	if src.Enabled != dst.Enabled {
+		// Only override if explicitly set; false is zero-value so we
+		// check the parent struct instead — Otel overrides always apply.
+		dst.Enabled = src.Enabled
+	}
+	if src.LogLevel != "" {
+		dst.LogLevel = src.LogLevel
+	}
+	if src.LogFormat != "" {
+		dst.LogFormat = src.LogFormat
+	}
+	if src.LogContext {
+		dst.LogContext = true
+	}
+	if src.Traces != dst.Traces {
+		dst.Traces = src.Traces
+	}
+	if src.Metrics != dst.Metrics {
+		dst.Metrics = src.Metrics
+	}
+	if src.WarnMB != 0 {
+		dst.WarnMB = src.WarnMB
+	}
+	if src.MaxMB != 0 {
+		dst.MaxMB = src.MaxMB
+	}
+	if src.MetricsFlushMinutes != 0 {
+		dst.MetricsFlushMinutes = src.MetricsFlushMinutes
+	}
+	if src.DebugLogMaxBytes != 0 {
+		dst.DebugLogMaxBytes = src.DebugLogMaxBytes
+	}
+	if src.DebugLogMaxFiles != 0 {
+		dst.DebugLogMaxFiles = src.DebugLogMaxFiles
+	}
+	return dst
+}
+
+// mergeMCPServers merges two MCP server lists by name: entries in src with a
+// matching name in dst replace the dst entry; new names are appended.
+func mergeMCPServers(dst, src []MCPServerConfig) []MCPServerConfig {
+	idx := make(map[string]int, len(dst))
+	for i, s := range dst {
+		idx[s.Name] = i
+	}
+	for _, s := range src {
+		if i, ok := idx[s.Name]; ok {
+			dst[i] = s
+		} else {
+			dst = append(dst, s)
+		}
+	}
+	return dst
+}
+
+// mergeAgents merges two agent lists by name, same logic as mergeMCPServers.
+func mergeAgents(dst, src []AgentConfig) []AgentConfig {
+	idx := make(map[string]int, len(dst))
+	for i, a := range dst {
+		idx[a.Name] = i
+	}
+	for _, a := range src {
+		if i, ok := idx[a.Name]; ok {
+			dst[i] = a
+		} else {
+			dst = append(dst, a)
+		}
+	}
+	return dst
+}
+
+type Rules struct {
+	// Hard thresholds (conclusive)
+	EscalateAboveTokens int      `json:"escalate_above_tokens"`
+	EscalateKeywords    []string `json:"escalate_keywords"`
+	LocalBelowTokens    int      `json:"local_below_tokens"`
+
+	// Weighted scoring (soft signals)
+	// Score >= EscalateThreshold → conclusive escalation
+	// Score <= LocalThreshold    → conclusive local
+	// Otherwise                  → inconclusive (LLM classifier)
+	EscalateThreshold int `json:"escalate_threshold"`
+	LocalThreshold    int `json:"local_threshold"`
+
+	// Per-signal weights (positive = escalate, negative = local)
+	LocalVerbWeight    int `json:"local_verb_weight"`
+	EscalateVerbWeight int `json:"escalate_verb_weight"`
+	PathRefWeight      int `json:"path_ref_weight"`
+	CodeBlockWeight    int `json:"code_block_weight"`
+	OpenQuestionWeight int `json:"open_question_weight"`
+
+	// Configurable fallback when rules are inconclusive
+	// "local" = call local LLM classifier; "claude" = escalate directly
+	ClassifierFallback string `json:"classifier_fallback"`
+
+	// Keyword lists (overridable)
+	LocalVerbs    []string `json:"local_verbs"`
+	EscalateVerbs []string `json:"escalate_verbs"`
+
+	// OpenQuestionPrefixes is the list of prompt-opening words/phrases that
+	// trigger the open-question soft signal (score += open_question_weight).
+	// Matching is case-insensitive and anchored to the start of the trimmed prompt.
+	// Add language-specific or domain-specific prefixes here to extend coverage.
+	OpenQuestionPrefixes []string `json:"open_question_prefixes"`
+}
+
+// DefaultOpenQuestionPrefixes is the built-in fallback used when
+// Rules.OpenQuestionPrefixes is empty (e.g. configs written before this field existed).
+var DefaultOpenQuestionPrefixes = []string{
+	// English
+	"what", "why", "how", "when", "where", "who", "which",
+	"could you", "can you", "would you", "should", "is it",
+	"are there", "do you", "does",
+	// Italian
+	"cosa", "come", "perché", "quando", "dove", "chi", "quale", "quali",
+	"potresti", "puoi", "dovresti", "è possibile", "ci sono", "sai",
+}
+
+// DefaultMaxPayloadBytes is the default maximum HTTP request body size for
+// local LLM agents. This is conservative (900KB) to stay safely under
+// typical reverse proxy limits (1MB default for nginx/openresty).
+// When the marshaled chatRequest exceeds this limit, message history is
+// trimmed further before sending.
+const DefaultMaxPayloadBytes = 900 * 1024
+
+// OtelConfig controls OpenTelemetry signal collection and file management.
+type OtelConfig struct {
+	Enabled             bool   `json:"enabled"`
+	LogLevel            string `json:"log_level"`   // minimum log level: DEBUG | INFO | WARN | ERROR (default INFO)
+	LogFormat           string `json:"log_format"`  // "text" (default, human-readable), "json" (structured), "off" (disabled)
+	LogContext          bool   `json:"log_context"` // when true, log the full serialised request payload on each inference call
+	Traces              bool   `json:"traces"`
+	Metrics             bool   `json:"metrics"`
+	WarnMB              int    `json:"warn_mb"`                       // warn when any otel file exceeds this (0 = off)
+	MaxMB               int    `json:"max_mb"`                        // hard cap, disable otel when exceeded (0 = off)
+	MetricsFlushMinutes int    `json:"metrics_flush_minutes"`         // periodic flush interval (0 = session-end only)
+	PreDebugLogLevel    string `json:"pre_debug_log_level,omitempty"` // saved by debug enable; restored by debug disable
+	DebugLogMaxBytes    int64  `json:"debug_log_max_bytes"`           // per-file cap, default 104857600 (100 MB)
+	DebugLogMaxFiles    int    `json:"debug_log_max_files"`           // rotated files to keep, default 5
+}
+
+// AgentConfig holds configuration for a single agent backend.
+// Multiple backends can be listed under agents; the active one is
+// selected by name via the agent field (defaults to the first non-cli entry).
+//
+// Provider values:
+//
+//	"" or "local"  — plain HTTP, no auth (OpenAI-compat inference server)
+//	"bedrock"      — AWS SigV4 signing, native Converse API
+//	"claude-cli"   — Claude Code CLI subprocess (not an HTTP backend)
+//	anything else  — Bearer token via APIKey or TokenCmd
+type AgentConfig struct {
+	Name string `json:"name"` // display name, used as selector key
+
+	URL   string `json:"url,omitempty"`   // base URL of the inference server (unused for claude-cli)
+	Model string `json:"model,omitempty"` // model name or ARN (unused for claude-cli)
+
+	// Provider selects the backend type / auth transport.
+	Provider string `json:"provider,omitempty"`
+
+	// APIKey is a Bearer token / API key used when Provider is not "", "local", "bedrock", or "claude-cli".
+	APIKey string `json:"api_key,omitempty"`
+
+	// TokenCmd is a shell command whose stdout is used as the Bearer token,
+	// evaluated once at startup. Takes precedence over APIKey when non-empty.
+	// Example: "gh auth token --hostname myorg.ghe.com"
+	TokenCmd string `json:"token_cmd,omitempty"`
+
+	// Headers are extra HTTP headers injected on every request (e.g. "api-key" for Azure,
+	// "HTTP-Referer" for OpenRouter).
+	Headers map[string]string `json:"headers,omitempty"`
+
+	// ChatPath overrides the inference endpoint path (default "/v1/chat/completions").
+	ChatPath string `json:"chat_path,omitempty"`
+
+	// APIFormat selects the wire protocol format for HTTP agents.
+	// "" or "chat_completions" — OpenAI Chat Completions API (default)
+	// "responses"             — OpenAI Responses API (/v1/responses)
+	APIFormat string `json:"api_format,omitempty"`
+
+	// TLSSkipVerify disables TLS certificate verification. Use only for dev/self-signed certs.
+	TLSSkipVerify bool `json:"tls_skip_verify,omitempty"`
+	// TLSCACert is a path to a PEM-encoded CA cert for private/self-signed endpoints.
+	TLSCACert string `json:"tls_ca_cert,omitempty"`
+
+	// AWS credentials for Provider = "bedrock".
+	AWSRegion  string `json:"aws_region,omitempty"`
+	AWSKeyID   string `json:"aws_key_id,omitempty"`
+	AWSSecret  string `json:"aws_secret,omitempty"`
+	AWSToken   string `json:"aws_token,omitempty"`   // optional session token
+	AWSService string `json:"aws_service,omitempty"` // default "bedrock"
+	// AWSRefreshCmd is a credential_process-compatible command whose JSON output
+	// (AccessKeyId / SecretAccessKey / SessionToken) is used to refresh expired
+	// STS session tokens mid-request.
+	AWSRefreshCmd string `json:"aws_refresh_cmd,omitempty"`
+	// PromptCaching enables AWS Bedrock's explicit cachePoint prompt caching for
+	// Provider = "bedrock" only: an extra {"cachePoint":{"type":"default"}} block
+	// is appended to the end of the Converse API system array. Opt-in and off by
+	// default because sending a cachePoint block to a model or region that
+	// doesn't support prompt caching is a hard API error, not a graceful no-op.
+	//
+	// EXPERIMENTAL: implemented and unit-tested against AWS's documented
+	// Converse API contract, but not exercised against a real Bedrock endpoint
+	// (no Bedrock agent was available during development). See docs/providers.md.
+	PromptCaching bool `json:"prompt_caching,omitempty"`
+
+	// Vision declares that this agent's model accepts image input (an
+	// "image_url" content part). Opt-in and off by default: sending an image
+	// part to an endpoint that doesn't support vision is a hard API error
+	// ("No endpoints found that support image input"), not a graceful no-op.
+	// Gates the automatic image attached when an MCP tool result contains one
+	// (e.g. a screenshot); does not affect the user-initiated /attach path.
+	Vision bool `json:"vision,omitempty"`
+
+	// RunCmd is an optional shell command that starts the inference server when
+	// it is not already reachable. milk runs this command in the background on
+	// startup (and on-demand when the agent is first used) if a Ping to the URL
+	// fails. Only meaningful for HTTP-based local providers.
+	// Example: "llama-server -m ~/models/qwen2.5-coder-7b-q4.gguf --port 8080 -ngl 99"
+	RunCmd string `json:"run_cmd,omitempty"`
+
+	// Fields for Provider = "claude-cli".
+	// Bin is the path to the claude binary (default "claude").
+	Bin string `json:"bin,omitempty"`
+	// DangerouslySkipPermissions passes --dangerously-skip-permissions to the CLI.
+	DangerouslySkipPermissions bool `json:"dangerously_skip_permissions,omitempty"`
+	// AllowedTools is a list of tools pre-approved for this CLI agent.
+	AllowedTools []string `json:"allowed_tools,omitempty"`
+	// AddDirs is a list of extra directories to pass with --add-dir.
+	AddDirs []string `json:"add_dirs,omitempty"`
+	// SettingsJSON is an optional JSON object passed to the Claude CLI via
+	// --settings. Accepts the same schema as Claude's settings.local.json
+	// (e.g. {"env": {"KEY": "value"}}). Written to a temp file at invocation time.
+	SettingsJSON json.RawMessage `json:"settings,omitempty"`
+
+	// Fields for Provider = "subprocess".
+	// ActionType selects the smolagents agent class: "code" (default) or "tool_calling".
+	ActionType string `json:"action_type,omitempty"`
+	// ModelType is the smolagents model backend class name (default "OpenAIModel").
+	ModelType string `json:"model_type,omitempty"`
+	// SmolagentTools is the list of built-in smolagents tool names to enable.
+	SmolagentTools []string `json:"smolagent_tools,omitempty"`
+	// MaxSteps caps the smolagents ReAct loop (default 15).
+	MaxSteps int `json:"max_steps,omitempty"`
+	// AuthorizedImports lists Python packages the CodeAgent may import.
+	AuthorizedImports []string `json:"authorized_imports,omitempty"`
+
+	// MCPServers is the list of MCP server names (from Config.MCPServers) that
+	// this agent is allowed to use as tools. When empty, no MCP tools are exposed.
+	MCPServers []string `json:"mcp_servers,omitempty"`
+
+	// ExtraArgs holds raw CLI arguments appended verbatim to the subprocess command.
+	// Used by aider-cli, subprocess, and any future external-process provider to pass provider-specific
+	// flags without requiring dedicated config fields.
+	ExtraArgs []string `json:"extra_args,omitempty"`
+
+	// SystemPromptTier selects the verbosity level of the system prompt sent to
+	// this agent. Valid values: "minimal", "standard" (default), "full".
+	//   "minimal"  — role framing only; tool-use instructions and reasoning
+	//                guidance sections are omitted.
+	//   "standard" — current default behaviour (role framing + full tool rules).
+	//   "full"     — standard plus additional verbose guidance.
+	// Empty string is treated as "standard".
+	SystemPromptTier string `json:"system_prompt_tier,omitempty"`
+
+	// DisableProjectInstructions turns off loading the target repo's
+	// AGENTS.md/CLAUDE.md into this agent's system/static context. Default:
+	// false (enabled) — set true if a repo's instructions file is irrelevant
+	// or wrong for this particular agent.
+	DisableProjectInstructions bool `json:"disable_project_instructions,omitempty"`
+
+	// DisableCompaction turns off the one-extra-inference-call summarization
+	// step that runs when this agent's message history would otherwise be
+	// hard-dropped for exceeding message_budget_chars/local_context_budget_chars
+	// (see cmd/milk/main.go's trimLocalMessagesWithCompaction). Default: false
+	// (enabled) — set true to skip the extra call's latency/cost and fall back
+	// to a plain drop-oldest-first trim, e.g. for a model that summarizes
+	// poorly or a provider Summarize doesn't support (Bedrock, Responses API —
+	// those already fall back automatically, but the flag avoids even
+	// attempting the call).
+	DisableCompaction bool `json:"disable_compaction,omitempty"`
+
+	// BashAllowedPatterns is a static, admin-configured allow-list of bash
+	// command prefixes that never require a permission ask/grant for this
+	// agent — a finer-grained alternative to a blanket "bash" grant (see
+	// docs/prompt-context-management-review.md §8 rec #8). Each entry is
+	// matched against the tool call's actual "command" argument: an entry
+	// ending in "*" matches by prefix (e.g. "git diff*" matches "git diff
+	// --stat HEAD"); an entry with no "*" must match the whole command
+	// exactly. A command that doesn't match any pattern here falls through
+	// to the normal PermStore grant/ask flow unchanged — this only adds a
+	// fast, safe pre-approval path, it never narrows what a plain "bash"
+	// grant already allows.
+	BashAllowedPatterns []string `json:"bash_allowed_patterns,omitempty"`
+
+	// ContextWindowTokens is the context window size of this agent's model in
+	// tokens. When set and no explicit limits.message_budget_chars or
+	// limits.max_tool_iterations override is configured, milk auto-derives
+	// sensible defaults:
+	//   MessageBudgetChars = ContextWindowTokens * 3  (75% of window × 4 chars/token)
+	//   MaxToolIterations  = max(5, ContextWindowTokens/4096)
+	// Set to 0 (the default) to use the global config defaults instead.
+	ContextWindowTokens int `json:"context_window_tokens,omitempty"`
+
+	// Limits holds optional per-agent overrides for context caps and injection limits.
+	// Nil fields fall back to the global Config defaults.
+	Limits *AgentLimits `json:"limits,omitempty"`
+
+	// Tools is an optional per-agent override/extension of Config.AgentTools.
+	// An entry whose Agent name matches a global entry replaces it; new names are appended.
+	Tools []AgentToolEntry `json:"tools,omitempty"`
+
+	// Prompt is an optional inline system prompt prepended to this agent's default
+	// system prompt on every turn. Supports {{milk:memory}}, {{milk:need}},
+	// {{milk:escalation}}, and {{milk:tools}} placeholders.
+	// When PromptFile is also set, PromptFile takes precedence.
+	Prompt string `json:"prompt,omitempty"`
+
+	// PromptFile is a path to a .md or .txt file whose contents are used as the
+	// agent's custom system prompt. Takes precedence over Prompt when both are set.
+	PromptFile string `json:"prompt_file,omitempty"`
+}
+
+// AgentToolEntry defines a peer agent that can be called as a tool by another agent.
+type AgentToolEntry struct {
+	Agent       string `json:"agent"`
+	Description string `json:"description"`
+	Enabled     *bool  `json:"enabled,omitempty"` // nil = true
+}
+
+// IsEnabled reports whether this tool entry is enabled.
+// Returns true when Enabled is nil (default on) or explicitly true.
+func (e AgentToolEntry) IsEnabled() bool {
+	return e.Enabled == nil || *e.Enabled
+}
+
+// AgentLimits holds optional per-agent overrides for context caps and injection
+// limits. A nil field means "use the global default from Config". All integer
+// fields use pointer types with the following semantics: nil = use global
+// default, negative (e.g. -1) = disabled/unlimited (resolves to 0), zero =
+// use the built-in hardcoded default, positive = exact value.
+//
+// These mirror the global fields on Config but without the Local* prefix — the
+// distinction was a legacy artefact of fixed role assignments. When set on an
+// AgentConfig, they override the global value for that specific agent regardless
+// of whether it is acting as primary or escalation.
+type AgentLimits struct {
+	// ContextBudgetChars overrides context_budget_chars for this agent.
+	ContextBudgetChars *int `json:"context_budget_chars,omitempty"`
+	// MessageBudgetChars overrides local_context_budget_chars (message history trim).
+	MessageBudgetChars *int `json:"message_budget_chars,omitempty"`
+	// MemoryReinjectionTurns overrides memory_reinjection_turns / local_memory_reinjection_turns.
+	MemoryReinjectionTurns *int `json:"memory_reinjection_turns,omitempty"`
+	// MemoryReinjectionBytes overrides memory_reinjection_bytes / local_memory_reinjection_bytes.
+	MemoryReinjectionBytes *int `json:"memory_reinjection_bytes,omitempty"`
+	// MemoryResultMaxBytes overrides local_memory_result_max_bytes.
+	MemoryResultMaxBytes *int `json:"memory_result_max_bytes,omitempty"`
+	// ToolResultMaxBytes overrides local_tool_result_max_bytes.
+	ToolResultMaxBytes *int `json:"tool_result_max_bytes,omitempty"`
+	// PerceptInjectMax overrides percept_inject_max.
+	PerceptInjectMax *int `json:"percept_inject_max,omitempty"`
+	// PerceptInjectMaxBytes overrides percept_inject_max_bytes.
+	PerceptInjectMaxBytes *int `json:"percept_inject_max_bytes,omitempty"`
+	// PerceptRelevanceGate overrides percept_relevance_gate.
+	PerceptRelevanceGate *bool `json:"percept_relevance_gate,omitempty"`
+	// MaxToolIterations overrides local_max_tool_iterations for this agent.
+	MaxToolIterations *int `json:"max_tool_iterations,omitempty"`
+	// ReturningFreshStartLocalTurns overrides returning_fresh_start_local_turns for
+	// this agent. When non-zero, a ContextModeReturning escalation is downgraded to
+	// a fresh start (no --resume) when this many local turns have elapsed since the
+	// last escalation turn. Set to -1 to disable the turn-gap check for this agent.
+	ReturningFreshStartLocalTurns *int `json:"returning_fresh_start_local_turns,omitempty"`
+
+	// TurnTimeoutSecs overrides the per-turn timeout for this agent.
+	// The global default is 10 minutes. Set higher for agents that run long
+	// synchronous workflows (e.g. a claude-cli escalation agent doing multi-sprint work).
+	// Set to -1 for no timeout.
+	TurnTimeoutSecs *int `json:"turn_timeout_secs,omitempty"`
+
+	// ToolTimeoutSecs is the per-individual-tool timeout, independent of TurnTimeoutSecs.
+	// After a tool runs for this duration its context is cancelled and the tool
+	// call returns an error result to the model. Other tools in the same batch are
+	// unaffected. Default: 120 s (2 min). Set to -1 for no per-tool limit.
+	ToolTimeoutSecs *int `json:"tool_timeout_secs,omitempty"`
+
+	// MaxPayloadBytes overrides the maximum HTTP request body size (bytes)
+	// for this agent. When the marshaled chatRequest exceeds this limit,
+	// message history is trimmed further before sending to avoid 413 errors
+	// from reverse proxies (e.g. openresty/nginx).
+	// Default: 900KB (conservative margin below typical 1MB proxy limits).
+	MaxPayloadBytes *int `json:"max_payload_bytes,omitempty"`
+
+	// IncludedTools is a whitelist of tool names exposed to this agent. When
+	// non-empty, only the listed names are included in the outgoing request
+	// payload (applied to the base tool set before ExcludedTools).
+	// Names must match exactly the tool function names (e.g. "bash", "read_file").
+	IncludedTools []string `json:"included_tools,omitempty"`
+
+	// ExcludedTools is a list of tool names to remove from the base tool set.
+	// Applied after IncludedTools. Names must match exactly (e.g. "http_get").
+	ExcludedTools []string `json:"excluded_tools,omitempty"`
+}
+
+// IsCLI reports whether this agent uses the Claude Code CLI backend.
+func (a AgentConfig) IsCLI() bool {
+	return strings.ToLower(strings.TrimSpace(a.Provider)) == "claude-cli"
+}
+
+// IsSubprocess reports whether this agent uses the generic subprocess provider.
+func (a AgentConfig) IsSubprocess() bool {
+	return strings.ToLower(strings.TrimSpace(a.Provider)) == "subprocess"
+}
+
+// IsAiderCLI reports whether this agent uses the aider-cli backend.
+func (a AgentConfig) IsAiderCLI() bool {
+	return strings.ToLower(strings.TrimSpace(a.Provider)) == "aider-cli"
+}
+
+// IsExternalProcess reports whether this agent runs as an external process (claude-cli, subprocess, or aider-cli).
+func (a AgentConfig) IsExternalProcess() bool {
+	return a.IsCLI() || a.IsSubprocess() || a.IsAiderCLI()
+}
+
+// defaultCLIAgent is the built-in claude-cli entry added when no agent
+// named "claude" exists. It is never written to disk unless the user edits it.
+func defaultCLIAgent() AgentConfig {
+	return AgentConfig{
+		Name:     "claude",
+		Provider: "claude-cli",
+		Bin:      "claude",
+	}
+}
+
+// MCPServerConfig holds connection settings for one MCP server.
+// MCP servers expose callable tools to agents; they are not agents themselves
+// and are never used for routing, escalation, or conversation turns.
+type MCPServerConfig struct {
+	// Name is the unique identifier referenced from AgentConfig.MCPServers.
+	Name string `json:"name"`
+
+	// URL is the MCP endpoint (e.g. "http://localhost:3000/mcp").
+	// For Streamable HTTP transport (2025-03-26) this is a single POST+GET endpoint.
+	URL string `json:"url,omitempty"`
+
+	// Transport selects the wire protocol. "http" (default) uses Streamable HTTP
+	// with SSE fallback for older servers. "stdio" launches the server as a
+	// subprocess and communicates over its stdin/stdout (newline-delimited JSON-RPC).
+	Transport string `json:"transport,omitempty"`
+
+	// Auth selects the authentication method.
+	// "" or "none" — no auth (local servers)
+	// "bearer"     — static Bearer token via APIKey
+	// "token_cmd"  — dynamic token from TokenCmd stdout
+	Auth string `json:"auth,omitempty"`
+
+	// APIKey is the static Bearer token. Used when Auth == "bearer".
+	APIKey string `json:"api_key,omitempty"`
+
+	// TokenCmd is a shell command whose stdout is the Bearer token.
+	// Takes precedence over APIKey when Auth == "token_cmd".
+	TokenCmd string `json:"token_cmd,omitempty"`
+
+	// ClientID is a pre-registered OAuth client ID. When set, dynamic client
+	// registration (RFC 7591) is skipped. Used with Auth == "oauth".
+	ClientID string `json:"oauth_client_id,omitempty"`
+
+	// ClientSecret is the pre-registered OAuth client secret, for confidential
+	// clients. Most MCP OAuth setups use public clients + PKCE and leave this
+	// empty. Used with Auth == "oauth".
+	ClientSecret string `json:"oauth_client_secret,omitempty"`
+
+	// Scopes overrides the OAuth scope(s) requested during authorization.
+	// When empty, milk requests no explicit scope parameter.
+	Scopes []string `json:"oauth_scopes,omitempty"`
+
+	// AuthTimeout bounds how long /mcp auth waits for the browser callback
+	// (e.g. "5m"). Default: 5 minutes.
+	AuthTimeout string `json:"oauth_auth_timeout,omitempty"`
+
+	// Timeout is the per-request timeout (e.g. "30s"). Default: 30s.
+	Timeout string `json:"timeout,omitempty"`
+
+	// ConnectTimeout is the timeout for the initial MCP handshake (e.g. "5s"). Default: 5s.
+	// If the server is unreachable at startup, the client will retry lazily on the first tool call.
+	ConnectTimeout string `json:"connect_timeout,omitempty"`
+
+	// Enabled controls whether this server is active. Default: true.
+	// Set to false to temporarily disable without removing the entry.
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// TLSSkipVerify disables TLS certificate verification for dev/self-signed certs.
+	TLSSkipVerify bool `json:"tls_skip_verify,omitempty"`
+
+	// Command is the executable path for stdio transport servers.
+	// Only used when Transport == "stdio".
+	Command string `json:"command,omitempty"`
+
+	// Args are the command-line arguments passed to Command.
+	// Only used when Transport == "stdio".
+	Args []string `json:"args,omitempty"`
+}
+
+// IsEnabled reports whether this MCP server entry is enabled.
+// Returns true when Enabled is nil (default on) or explicitly true.
+func (m MCPServerConfig) IsEnabled() bool {
+	return m.Enabled == nil || *m.Enabled
+}
+
+// IsOAuth reports whether this MCP server uses the native OAuth flow.
+func (m MCPServerConfig) IsOAuth() bool {
+	return strings.EqualFold(m.Auth, "oauth")
+}
+
+type Config struct {
+	// Agent is the name of the active primary backend from Agents.
+	// If empty, the first non-claude-cli entry is used.
+	Agent  string        `json:"agent,omitempty"`
+	Agents []AgentConfig `json:"agents,omitempty"`
+
+	// MCPServers is the list of MCP tool-server endpoints available to agents.
+	// Each agent opts in to specific servers by listing their names in
+	// AgentConfig.MCPServers. Servers listed here but not referenced by any
+	// agent are loaded but never connected.
+	MCPServers []MCPServerConfig `json:"mcp_servers,omitempty"`
+
+	// EscalationAgent selects which backend handles escalated turns.
+	// Defaults to "claude" (the built-in claude-cli entry).
+	// Set to the name of any agents entry to route escalated turns there.
+	EscalationAgent string `json:"escalation_agent,omitempty"`
+
+	// AgentTools is the global list of peer agents available as tools to all agents.
+	// Per-agent entries in AgentConfig.Tools shadow or extend this list.
+	AgentTools []AgentToolEntry `json:"agent_tools,omitempty"`
+
+	// MaxBackgroundAgents bounds how many spawn_background_agent jobs (see
+	// ADR-0043) may run concurrently per session, across however many turns
+	// spawn them. Defaults to 3 when unset or non-positive.
+	MaxBackgroundAgents int `json:"max_background_agents,omitempty"`
+
+	// BackgroundAgentTimeoutMinutes bounds how long a single
+	// spawn_background_agent job (ADR-0043) may run once it starts
+	// executing before being terminated as failed. Defaults to 20 minutes
+	// when unset or non-positive — generous on purpose, since loop
+	// detection (not this timeout) is the primary defense against a job
+	// that's actually stuck; this only needs to catch one that's still
+	// making real progress but never finishing (see
+	// internal/agent/local's defaultJobTimeout doc comment).
+	BackgroundAgentTimeoutMinutes int `json:"background_agent_timeout_minutes,omitempty"`
+
+	DefaultRoute string     `json:"default_route,omitempty"`
+	Rules        Rules      `json:"rules"`
+	Otel         OtelConfig `json:"otel"`
+
+	// Colorization controls transcript syntax highlighting.
+	// "off"      — no colorization
+	// "fenced"   — fenced code blocks only
+	// "balanced" — fenced blocks + inline Markdown (default)
+	// "full"     — full Markdown render via glamour
+	Colorization string `json:"colorization,omitempty"`
+
+	// DebugCLILog writes every raw NDJSON line from the claude subprocess to
+	// ~/.milk/claude_debug.ndjson.
+	DebugCLILog bool `json:"debug_claude_code,omitempty"`
+
+	// DebugLocalLog writes every raw SSE line from the local agent's HTTP
+	// stream to ~/.milk/local_debug.log, including lines that are skipped or
+	// fail to parse. Useful for diagnosing dropped tokens or unknown events.
+	DebugLocalLog bool `json:"debug_local,omitempty"`
+
+	// DebugSubprocessLog writes every raw stdout line from subprocess agents
+	// (aider-cli, smolagent) to ~/.milk/subprocess_debug.log.
+	DebugSubprocessLog bool `json:"debug_subprocess,omitempty"`
+
+	// AWSAuthRefresh enables AWS credential injection for the claude subprocess.
+	AWSAuthRefresh bool `json:"aws_auth_refresh,omitempty"`
+
+	// ShowReasoning controls whether thinking/reasoning tokens are visible in the
+	// transcript by default. Can be toggled live with /think on|off.
+	// false (default) = show "[thinking…]" placeholder; true = show reasoning.
+	ShowReasoning *bool `json:"show_reasoning,omitempty"`
+
+	// StickyEscalation controls whether the escalation agent is automatically
+	// kept for subsequent turns after the router first escalates (without an
+	// explicit /escalate command). true (default) — router-triggered escalations
+	// are sticky until the user types /primary or Ctrl+C. false — routing is
+	// re-evaluated every turn as before. Explicit /escalate commands always pin
+	// regardless of this setting.
+	StickyEscalation *bool `json:"sticky_escalation,omitempty"`
+
+	// ContextBudgetChars is the maximum number of characters injected per
+	// agent summary brick (last_local_summary / last_claude_summary) in the
+	// escalation system prompt. Turns are included newest-first until the
+	// budget is exhausted. Default: 12000.
+	ContextBudgetChars int `json:"context_budget_chars,omitempty"`
+
+	// MemoryReinjectionTurns is the number of escalation turns after which the
+	// memory/need instruction block is unconditionally re-injected, even when it
+	// was already sent in a prior turn. Guards against agent-side context truncation.
+	// Default: 20. Set to 0 to disable this threshold.
+	MemoryReinjectionTurns int `json:"memory_reinjection_turns,omitempty"`
+
+	// MemoryReinjectionBytes is the total bytes of escalation assistant output
+	// after which the memory/need instruction block is unconditionally re-injected.
+	// Default: 40000. Set to 0 to disable this threshold.
+	MemoryReinjectionBytes int `json:"memory_reinjection_bytes,omitempty"`
+
+	// PerceptInjectMax caps the number of percepts injected into the escalation
+	// context per turn. Lowest-weight percepts are dropped when over budget.
+	// Default: 25. Set to 0 for no limit.
+	PerceptInjectMax int `json:"percept_inject_max,omitempty"`
+
+	// PerceptInjectMaxBytes caps the total byte size of percept content injected
+	// per turn. Lowest-weight percepts are dropped when over budget.
+	// Default: 2048. Set to 0 for no limit.
+	PerceptInjectMaxBytes int `json:"percept_inject_max_bytes,omitempty"`
+
+	// PerceptStoreMax caps the total number of percepts in the global store.
+	// After consolidation, lowest-weight non-core percepts are pruned to this limit.
+	// Default: 0 (no limit).
+	PerceptStoreMax int `json:"percept_store_max,omitempty"`
+
+	// PerceptRelevanceGate enables keyword-intersection filtering before injection:
+	// percepts with zero token overlap with the current prompt are skipped.
+	// Default: true. Set to false to disable.
+	PerceptRelevanceGate *bool `json:"percept_relevance_gate,omitempty"`
+
+	// LocalMemoryResultMaxBytes caps the byte size of memory tool results
+	// (get_memory, list_memory) returned to the local agent per tool call.
+	// Results are truncated to this limit before being appended to the
+	// local context. Default: 2048. Set to 0 for no limit.
+	LocalMemoryResultMaxBytes int `json:"local_memory_result_max_bytes,omitempty"`
+
+	// LocalToolResultMaxBytes caps the byte size of any other tool result
+	// (bash, read_file, …) appended to the local agent's context — unlike
+	// memory tool results, these have no cap of their own and a single
+	// verbose shell/build/test output can otherwise dominate a turn's
+	// payload before the payload-size trim loop ever gets a chance to run.
+	// Truncation keeps both ends (see truncateHeadAndTail) since shell/build
+	// output's most important signal is typically at the end.
+	// Default: 20000 (~5000 tokens). Set to 0 for no limit.
+	LocalToolResultMaxBytes int `json:"local_tool_result_max_bytes,omitempty"`
+
+	// LocalMemoryReinjectionTurns is the number of local agent turns after which
+	// the memory/need instruction block is unconditionally re-appended to the
+	// local agent's context. Mirrors memory_reinjection_turns for the escalation
+	// path. Default: 20. Set to -1 to disable.
+	LocalMemoryReinjectionTurns int `json:"local_memory_reinjection_turns,omitempty"`
+
+	// LocalMemoryReinjectionBytes is the total bytes of local agent output
+	// after which the memory/need instruction block is re-appended.
+	// Default: 40000. Set to -1 to disable.
+	LocalMemoryReinjectionBytes int `json:"local_memory_reinjection_bytes,omitempty"`
+
+	// LocalContextBudgetChars is the maximum total character count of the
+	// messages array passed to the local inference server per turn. When the
+	// accumulated history exceeds this budget, the oldest user+assistant pairs
+	// are dropped until it fits. Default: 24000. Set to 0 for no limit.
+	LocalContextBudgetChars int `json:"local_context_budget_chars,omitempty"`
+
+	// LocalMaxToolIterations caps the number of consecutive tool-call / response
+	// cycles the local agent may execute before the turn is aborted with an error.
+	// Default: 20. Set to 0 to use the default; set to -1 for unlimited.
+	LocalMaxToolIterations int `json:"local_max_tool_iterations,omitempty"`
+
+	// ReturningFreshStartLocalTurns is the number of local-agent turns since the
+	// last escalation turn after which a ContextModeReturning escalation is
+	// downgraded to a fresh start (no --resume). The prior escalation session is
+	// considered stale at that point; the re-orientation context files already
+	// provide equivalent guidance. Default: 8. Set to 0 to disable the turn-gap
+	// condition entirely (need-staleness check is unaffected).
+	ReturningFreshStartLocalTurns int `json:"returning_fresh_start_local_turns,omitempty"`
+
+	// NeedExpiryHours is the number of hours after which a CurrentNeed is
+	// considered stale and cleared on session resume. Default: 24. Set to 0
+	// to disable time-based expiry (needs persist until fulfilled or manually
+	// cleared). See #134.
+	NeedExpiryHours int `json:"need_expiry_hours,omitempty"`
+
+	// RemoteOversight configures the remote oversight interface. When non-nil
+	// and a backend is configured, agent turn notifications and permission
+	// prompts are forwarded to the configured backend (e.g. Telegram).
+	RemoteOversight *RemoteOversightConfig `json:"remote_oversight,omitempty"`
+
+	// LoopDetection configures agent loop detection. When enabled, milk
+	// monitors turns for signs of the agent looping (repeated responses,
+	// high token velocity, echoing tool calls) and warns or interrupts.
+	LoopDetection *LoopDetectionConfig `json:"loop_detection,omitempty"`
+
+	// ConfigEditors is an ordered list of editor commands tried by
+	// "milk config open" / "/config open". The first command found on
+	// PATH is used. Entries may include "$EDITOR" or "$VISUAL" tokens
+	// which are expanded at runtime. If omitted, the default list is:
+	// ["$EDITOR", "$VISUAL", "nano", "vim", "vi"]
+	// Example: ["code --wait", "$EDITOR", "nano"]
+	ConfigEditors []string `json:"config_editors,omitempty"`
+
+	// UpdateCheck controls whether milk checks GitHub for new releases on startup.
+	// Default: true. Set to false to disable entirely.
+	UpdateCheck *bool `json:"update_check,omitempty"`
+
+	// UpdateChannel selects which releases are considered: "stable" skips pre-releases,
+	// "pre" includes them. Default: "pre" (all current releases are pre-releases).
+	UpdateChannel string `json:"update_channel,omitempty"`
+
+	// UpdateLastCheck is the RFC3339 timestamp of the last successful update check.
+	// Used to throttle checks to at most once every 24 hours.
+	UpdateLastCheck string `json:"update_last_check,omitempty"`
+
+	// UpdateSkippedVersion holds a release tag (e.g. "v0.0.12") the user chose to skip.
+	// The update badge is suppressed for this version until a newer one arrives.
+	UpdateSkippedVersion string `json:"update_skipped_version,omitempty"`
+
+	// ExperimentalPermissionManagement injects a system-prompt instruction into
+	// claude-cli turns that tells Claude to stop and announce when a tool call
+	// is denied with a "Stream closed" pre-flight error, rather than attempting
+	// workarounds. Milk then grants the permission and respawns the turn via its
+	// normal handleStreamClosedDenials path.
+	// Default: false (opt-in, experimental).
+	ExperimentalPermissionManagement bool `json:"experimental_permission_management,omitempty"`
+
+	// ExperimentalLazyHistoryManagement changes how agent history is included in
+	// context. When true, only the current agent's own turns and user turns are
+	// included proactively. Other agents' turns are excluded — the model fetches
+	// them on-demand via the get_session_context tool. Saves context budget,
+	// especially for the local model.
+	// Default: false (include all turns, current behavior).
+	ExperimentalLazyHistoryManagement bool `json:"experimental_lazy_history_management,omitempty"`
+
+	// DirectBash enables the direct shell-command shortcut: when a turn input
+	// looks like a shell command (heuristic check), milk asks for confirmation
+	// before running it locally instead of forwarding to an agent.
+	// Default: false (opt-in).
+	DirectBash bool `json:"direct_bash,omitempty"`
+
+	// DirectBashAllow is a list of command names (first tokens) that skip the
+	// confirmation prompt when DirectBash is enabled. Matching is case-insensitive
+	// against the first whitespace-delimited token of the input.
+	// Example: ["ls", "git", "docker"]
+	DirectBashAllow []string `json:"direct_bash_allow,omitempty"`
+
+	// ShellBinaries adds extra first-token names to the set recognised as
+	// shell commands by the shell-detector heuristic. Useful for uncommon
+	// binaries that aren't in the default known list.
+	// Example: ["task", "just", "mage"]
+	ShellBinaries []string `json:"shell_binaries,omitempty"`
+
+	// DisableModelsDevLookup turns off the models.dev catalog fallback used
+	// by AgentContextWindowTokens when an agent entry omits
+	// context_window_tokens. Default: false (lookup enabled) — set true for
+	// fully offline use, or if a matched value is wrong for a custom/
+	// fine-tuned model sharing a name with a catalog entry.
+	DisableModelsDevLookup bool `json:"disable_models_dev_lookup,omitempty"`
+}
+
+// RemoteOversightConfig holds settings for the remote oversight interface.
+type RemoteOversightConfig struct {
+	// Backend selects the transport. Currently only "telegram" is supported.
+	Backend string `json:"backend,omitempty"`
+
+	// Telegram holds Telegram-specific settings. Used when Backend == "telegram".
+	Telegram *TelegramConfig `json:"telegram,omitempty"`
+
+	// PermTimeoutSecs is how long to wait for a remote permission reply before
+	// falling back to TimeoutAction. Default: 120 (2 minutes).
+	PermTimeoutSecs int `json:"perm_timeout_secs,omitempty"`
+
+	// TimeoutAction is the fallback when no remote reply arrives within
+	// PermTimeoutSecs. One of "allow" or "deny". Default: "deny".
+	TimeoutAction string `json:"timeout_action,omitempty"`
+
+	// NotifyTools controls whether tool-use events are forwarded.
+	// Default: true.
+	NotifyTools *bool `json:"notify_tools,omitempty"`
+}
+
+// TelegramConfig holds Telegram Bot API settings.
+type TelegramConfig struct {
+	// Token is the bot token from @BotFather (e.g. "123456:ABC-DEF...").
+	Token string `json:"token,omitempty"`
+	// ChatID is the numeric chat/user ID to send messages to.
+	ChatID int64 `json:"chat_id,omitempty"`
+}
+
+// LoopDetectionConfig controls agent loop detection. When Enabled is true,
+// milk monitors turns for signs of the agent looping and warns or interrupts.
+type LoopDetectionConfig struct {
+	// Enabled turns on loop detection. Default: true.
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// MaxConsecutiveSimilarResponses is how many consecutive near-identical
+	// responses trigger the response-repetition signal. Default: 3.
+	MaxConsecutiveSimilarResponses int `json:"max_consecutive_similar_responses,omitempty"`
+
+	// ResponseSimilarityThreshold is the trigram Jaccard similarity above
+	// which two responses are considered "similar". Default: 0.85.
+	ResponseSimilarityThreshold *float64 `json:"response_similarity_threshold,omitempty"`
+
+	// TokenVelocityWindowSeconds is the sliding window (in seconds) for
+	// measuring token burn rate. Default: 60.
+	TokenVelocityWindowSeconds int `json:"token_velocity_window_seconds,omitempty"`
+
+	// TokenVelocityThreshold is the total tokens (input+output) consumed
+	// within the window that triggers the velocity signal. Default: 300000.
+	TokenVelocityThreshold *int64 `json:"token_velocity_threshold,omitempty"`
+
+	// MaxSilentBurnTokens is the input-token count above which a turn with
+	// near-zero output triggers the silent-burn signal. Default: 20000.
+	MaxSilentBurnTokens *int64 `json:"max_silent_burn_tokens,omitempty"`
+
+	// MaxConsecutiveTurnsWithoutUser is how many consecutive non-user turns
+	// trigger the turn-flood signal. Default: 10.
+	MaxConsecutiveTurnsWithoutUser int `json:"max_consecutive_turns_without_user,omitempty"`
+
+	// ToolEchoThreshold is how many consecutive turns with identical tool
+	// calls trigger the tool-echo signal. Default: 3.
+	ToolEchoThreshold int `json:"tool_echo_threshold,omitempty"`
+
+	// ChunkRepetitionThreshold is how many consecutive identical chunks
+	// must appear to trigger the intra-turn chunk repetition signal. Default: 5.
+	ChunkRepetitionThreshold int `json:"chunk_repetition_threshold,omitempty"`
+
+	// ChunkWindowSize is the number of recent chunks kept in the sliding
+	// window for intra-turn repetition detection. Default: 50.
+	ChunkWindowSize int `json:"chunk_window_size,omitempty"`
+
+	// ReasoningChunkRepetitionThreshold is how many consecutive identical
+	// reasoning/thinking chunks must appear to trigger the intra-turn
+	// reasoning repetition signal. Default: 10 (2x ChunkRepetitionThreshold).
+	ReasoningChunkRepetitionThreshold int `json:"reasoning_chunk_repetition_threshold,omitempty"`
+
+	// ChunkRepetitionMinScatteredLength is the minimum chunk length (runes)
+	// eligible for scattered-repeat detection: the same long chunk recurring
+	// within the window without requiring adjacency. Default: 40.
+	ChunkRepetitionMinScatteredLength int `json:"chunk_repetition_min_scattered_length,omitempty"`
+
+	// ReasoningMaxConsecutiveSimilarResponses is how many consecutive
+	// near-identical reasoning texts trigger the cross-turn reasoning
+	// repetition signal. Default: 6 (2x MaxConsecutiveSimilarResponses).
+	ReasoningMaxConsecutiveSimilarResponses int `json:"reasoning_max_consecutive_similar_responses,omitempty"`
+
+	// AutoInterrupt causes high-confidence signals to cancel the running
+	// turn automatically. Default: false (warn only).
+	AutoInterrupt *bool `json:"auto_interrupt,omitempty"`
+}
+
+func defaults() Config {
+	return Config{
+		DefaultRoute: "local",
+		Colorization: "balanced",
+		Otel: OtelConfig{
+			Enabled:             true,
+			LogLevel:            "INFO",
+			Traces:              true,
+			Metrics:             true,
+			WarnMB:              50,
+			MaxMB:               0,
+			MetricsFlushMinutes: 5,
+			DebugLogMaxBytes:    104857600,
+			DebugLogMaxFiles:    5,
+		},
+		Rules: Rules{
+			EscalateAboveTokens: 2000,
+			EscalateKeywords:    []string{"refactor entire", "context brick", "memory panel", "panel memory"},
+			LocalBelowTokens:    30,
+
+			EscalateThreshold: 6,
+			LocalThreshold:    -4,
+
+			LocalVerbWeight:    -3,
+			EscalateVerbWeight: 4,
+			PathRefWeight:      -2,
+			CodeBlockWeight:    -2,
+			OpenQuestionWeight: 3,
+
+			ClassifierFallback: "local",
+
+			LocalVerbs: []string{
+				// English
+				"grep", "find", "list", "run", "read", "fix", "debug", "show", "cat", "ls",
+				"check", "print", "count", "search", "add", "create", "write", "implement",
+				"rename", "delete", "move",
+				// Italian
+				"aggiungi", "crea", "scrivi", "implementa", "rinomina", "elimina", "sposta",
+				"cerca", "mostra", "controlla", "esegui", "leggi",
+			},
+			EscalateVerbs: []string{
+				// English
+				"architect", "design", "refactor", "explain why", "compare", "evaluate",
+				"plan", "propose", "summarize", "review", "analyze", "describe",
+				// Italian
+				"progetta", "refactorizza", "spiega perché", "confronta", "valuta",
+				"pianifica", "proponi", "riassumi", "revisiona", "analizza", "descrivi",
+			},
+			OpenQuestionPrefixes: []string{
+				// English
+				"what", "why", "how", "when", "where", "who", "which",
+				"could you", "can you", "would you", "should", "is it",
+				"are there", "do you", "does",
+				// Italian
+				"cosa", "come", "perché", "quando", "dove", "chi", "quale", "quali",
+				"potresti", "puoi", "dovresti", "è possibile", "ci sono", "sai",
+			},
+		},
+	}
+}
+
+// ContextBudget returns the configured context budget in characters,
+// falling back to 12000 when unset.
+func (c Config) ContextBudget() int {
+	if c.ContextBudgetChars <= 0 {
+		return 12000
+	}
+	return c.ContextBudgetChars
+}
+
+// EffectiveMaxBackgroundAgents returns the configured concurrent
+// spawn_background_agent limit (see ADR-0043), falling back to 3 when unset
+// or non-positive.
+func (c Config) EffectiveMaxBackgroundAgents() int {
+	if c.MaxBackgroundAgents <= 0 {
+		return 3
+	}
+	return c.MaxBackgroundAgents
+}
+
+// EffectiveBackgroundAgentTimeout returns the configured per-job
+// spawn_background_agent timeout (see ADR-0043), falling back to 20 minutes
+// when unset or non-positive — must match internal/agent/local's
+// defaultJobTimeout; config can't import that package (it would create an
+// import cycle, since internal/agent/local already imports internal/config
+// for AgentLimits), so the fallback is duplicated here rather than shared.
+func (c Config) EffectiveBackgroundAgentTimeout() time.Duration {
+	if c.BackgroundAgentTimeoutMinutes <= 0 {
+		return 20 * time.Minute
+	}
+	return time.Duration(c.BackgroundAgentTimeoutMinutes) * time.Minute
+}
+
+// MemoryReinjectionTurnThreshold returns the escalation-turn interval for
+// unconditional memory instruction re-injection, defaulting to 20.
+// Returns 0 when the threshold is explicitly disabled.
+func (c Config) MemoryReinjectionTurnThreshold() int {
+	if c.MemoryReinjectionTurns < 0 {
+		return 0
+	}
+	if c.MemoryReinjectionTurns == 0 {
+		return 20
+	}
+	return c.MemoryReinjectionTurns
+}
+
+// MemoryReinjectionByteThreshold returns the escalation assistant output byte
+// threshold for unconditional memory instruction re-injection, defaulting to 40000.
+// Returns 0 when the threshold is explicitly disabled.
+func (c Config) MemoryReinjectionByteThreshold() int {
+	if c.MemoryReinjectionBytes < 0 {
+		return 0
+	}
+	if c.MemoryReinjectionBytes == 0 {
+		return 40000
+	}
+	return c.MemoryReinjectionBytes
+}
+
+// PerceptInjectMaxCount returns the max number of percepts to inject per turn,
+// defaulting to 25. Returns 0 when explicitly disabled (unlimited).
+func (c Config) PerceptInjectMaxCount() int {
+	if c.PerceptInjectMax < 0 {
+		return 0
+	}
+	if c.PerceptInjectMax == 0 {
+		return 25
+	}
+	return c.PerceptInjectMax
+}
+
+// PerceptInjectMaxByteCount returns the max byte size of percept content to
+// inject per turn, defaulting to 2048. Returns 0 when explicitly disabled.
+func (c Config) PerceptInjectMaxByteCount() int {
+	if c.PerceptInjectMaxBytes < 0 {
+		return 0
+	}
+	if c.PerceptInjectMaxBytes == 0 {
+		return 2048
+	}
+	return c.PerceptInjectMaxBytes
+}
+
+// PerceptStoreSizeLimit returns the configured global store size cap.
+// Returns 0 when not set (no limit).
+func (c Config) PerceptStoreSizeLimit() int {
+	if c.PerceptStoreMax < 0 {
+		return 0
+	}
+	return c.PerceptStoreMax
+}
+
+// PerceptRelevanceGateEnabled returns whether relevance-gating is active.
+// Defaults to true when unset.
+func (c Config) PerceptRelevanceGateEnabled() bool {
+	if c.PerceptRelevanceGate == nil {
+		return true
+	}
+	return *c.PerceptRelevanceGate
+}
+
+// LocalMemoryResultMaxByteCount returns the max byte size of memory tool results
+// returned to the local agent per call, defaulting to 2048. Returns 0 when
+// explicitly disabled (unlimited).
+func (c Config) LocalMemoryResultMaxByteCount() int {
+	if c.LocalMemoryResultMaxBytes < 0 {
+		return 0
+	}
+	if c.LocalMemoryResultMaxBytes == 0 {
+		return 2048
+	}
+	return c.LocalMemoryResultMaxBytes
+}
+
+// LocalToolResultMaxByteCount returns the max byte size of a non-memory tool
+// result returned to the local agent per call, defaulting to 20000. Returns 0
+// when explicitly disabled (unlimited).
+func (c Config) LocalToolResultMaxByteCount() int {
+	if c.LocalToolResultMaxBytes < 0 {
+		return 0
+	}
+	if c.LocalToolResultMaxBytes == 0 {
+		return 20000
+	}
+	return c.LocalToolResultMaxBytes
+}
+
+// LocalMemoryReinjectionTurnThreshold returns the local-turn interval for
+// memory instruction re-injection, defaulting to 20. Returns 0 when disabled.
+func (c Config) LocalMemoryReinjectionTurnThreshold() int {
+	if c.LocalMemoryReinjectionTurns < 0 {
+		return 0
+	}
+	if c.LocalMemoryReinjectionTurns == 0 {
+		return 20
+	}
+	return c.LocalMemoryReinjectionTurns
+}
+
+// LocalMemoryReinjectionByteThreshold returns the local output byte threshold
+// for memory instruction re-injection, defaulting to 40000. Returns 0 when disabled.
+func (c Config) LocalMemoryReinjectionByteThreshold() int {
+	if c.LocalMemoryReinjectionBytes < 0 {
+		return 0
+	}
+	if c.LocalMemoryReinjectionBytes == 0 {
+		return 40000
+	}
+	return c.LocalMemoryReinjectionBytes
+}
+
+// PermTimeoutDuration returns the configured remote permission timeout,
+// defaulting to 120 seconds.
+func (r *RemoteOversightConfig) PermTimeoutDuration() time.Duration {
+	if r == nil || r.PermTimeoutSecs <= 0 {
+		return 120 * time.Second
+	}
+	return time.Duration(r.PermTimeoutSecs) * time.Second
+}
+
+// TimeoutActionValue returns the configured timeout action ("allow" or "deny"),
+// defaulting to "deny".
+func (r *RemoteOversightConfig) TimeoutActionValue() string {
+	if r == nil || r.TimeoutAction == "" {
+		return "deny"
+	}
+	return r.TimeoutAction
+}
+
+// NotifyToolsEnabled returns whether tool notifications are enabled.
+// Defaults to true.
+func (r *RemoteOversightConfig) NotifyToolsEnabled() bool {
+	if r == nil || r.NotifyTools == nil {
+		return true
+	}
+	return *r.NotifyTools
+}
+
+// LocalContextBudget returns the maximum total character count of the local
+// agent's messages array, defaulting to 24000. Returns 0 when explicitly
+// disabled (no limit).
+func (c Config) LocalContextBudget() int {
+	if c.LocalContextBudgetChars < 0 {
+		return 0
+	}
+	if c.LocalContextBudgetChars == 0 {
+		return 24000
+	}
+	return c.LocalContextBudgetChars
+}
+
+// --- Per-agent resolvers ---
+// Each resolver accepts an AgentConfig and returns the effective value for that
+// agent: the per-agent override when set, otherwise the global Config default.
+
+// AgentContextBudget returns the summary-brick budget for the given agent,
+// falling back to the global ContextBudget().
+func (c Config) AgentContextBudget(a AgentConfig) int {
+	if a.Limits != nil && a.Limits.ContextBudgetChars != nil {
+		v := *a.Limits.ContextBudgetChars
+		if v < 0 {
+			return 0
+		}
+		return intOr(v, 12000)
+	}
+	return c.ContextBudget()
+}
+
+// AgentContextWindowTokens returns the context window size (in tokens) for the
+// given agent. Falls back to a best-effort models.dev catalog lookup by the
+// agent's model name when context_window_tokens isn't set (unless disabled
+// via DisableModelsDevLookup); returns 0 when neither source has a value,
+// meaning no token-budget auto-derivation will occur. Callers should use
+// this value to auto-derive MessageBudgetChars and MaxToolIterations when
+// the corresponding limits are not explicitly set.
+func (c Config) AgentContextWindowTokens(a AgentConfig) int {
+	if a.ContextWindowTokens > 0 {
+		return a.ContextWindowTokens
+	}
+	if !c.DisableModelsDevLookup {
+		if window, ok := modelsdev.Lookup(a.Model); ok {
+			return window
+		}
+	}
+	return 0
+}
+
+// AgentMessageBudget returns the message-history trim budget for the given agent,
+// falling back (in order) to: explicit limits.message_budget_chars override,
+// auto-derived value from context_window_tokens, global LocalContextBudget().
+//
+// Auto-derivation formula: ContextWindowTokens * 3
+// (assumes ~4 chars/token and uses 75% of the window for history).
+func (c Config) AgentMessageBudget(a AgentConfig) int {
+	if a.Limits != nil && a.Limits.MessageBudgetChars != nil {
+		v := *a.Limits.MessageBudgetChars
+		if v < 0 {
+			return 0
+		}
+		return intOr(v, 24000)
+	}
+	// Auto-derive from context_window_tokens when no explicit override.
+	if ctw := c.AgentContextWindowTokens(a); ctw > 0 {
+		return ctw * 3
+	}
+	return c.LocalContextBudget()
+}
+
+// AgentMaxPayloadBytes returns the maximum HTTP request body size (bytes)
+// for the given agent, falling back to DefaultMaxPayloadBytes.
+// A value of 0 disables the payload size check.
+func (c Config) AgentMaxPayloadBytes(a AgentConfig) int {
+	if a.Limits != nil && a.Limits.MaxPayloadBytes != nil {
+		v := *a.Limits.MaxPayloadBytes
+		if v < 0 {
+			return 0
+		}
+		return v
+	}
+	return DefaultMaxPayloadBytes
+}
+
+// NeedExpiryHours returns the configured need expiry threshold in hours.
+// Default: 24. Returns 0 to disable time-based expiry.
+func (c Config) AgentNeedExpiryHours() int {
+	if c.NeedExpiryHours > 0 {
+		return c.NeedExpiryHours
+	}
+	return 24
+}
+
+// AgentMemoryReinjectionTurnThreshold returns the memory re-injection turn interval
+// for the given agent, falling back to the appropriate global default.
+// useLocalDefault selects which global field to fall back to (primary vs escalation).
+func (c Config) AgentMemoryReinjectionTurnThreshold(a AgentConfig, useLocalDefault bool) int {
+	if a.Limits != nil && a.Limits.MemoryReinjectionTurns != nil {
+		v := *a.Limits.MemoryReinjectionTurns
+		if v < 0 {
+			return 0
+		}
+		return intOr(v, 20)
+	}
+	if useLocalDefault {
+		return c.LocalMemoryReinjectionTurnThreshold()
+	}
+	return c.MemoryReinjectionTurnThreshold()
+}
+
+// AgentMemoryReinjectionByteThreshold returns the memory re-injection byte threshold
+// for the given agent, falling back to the appropriate global default.
+func (c Config) AgentMemoryReinjectionByteThreshold(a AgentConfig, useLocalDefault bool) int {
+	if a.Limits != nil && a.Limits.MemoryReinjectionBytes != nil {
+		v := *a.Limits.MemoryReinjectionBytes
+		if v < 0 {
+			return 0
+		}
+		return intOr(v, 40000)
+	}
+	if useLocalDefault {
+		return c.LocalMemoryReinjectionByteThreshold()
+	}
+	return c.MemoryReinjectionByteThreshold()
+}
+
+// AgentReturningFreshStartLocalTurns returns the local-turn threshold after which
+// a ContextModeReturning escalation is treated as a fresh start (no --resume),
+// for the given agent. Falls back to the global ReturningFreshStartLocalTurns.
+// Returns 0 when the turn-gap condition is disabled.
+func (c Config) AgentReturningFreshStartLocalTurns(a AgentConfig) int {
+	if a.Limits != nil && a.Limits.ReturningFreshStartLocalTurns != nil {
+		v := *a.Limits.ReturningFreshStartLocalTurns
+		if v < 0 {
+			return 0
+		}
+		return intOr(v, 8)
+	}
+	return intOr(c.ReturningFreshStartLocalTurns, 8)
+}
+
+// AgentMemoryResultMaxByteCount returns the memory tool result size cap for the
+// given agent, falling back to the global LocalMemoryResultMaxByteCount().
+func (c Config) AgentMemoryResultMaxByteCount(a AgentConfig) int {
+	if a.Limits != nil && a.Limits.MemoryResultMaxBytes != nil {
+		v := *a.Limits.MemoryResultMaxBytes
+		if v < 0 {
+			return 0
+		}
+		return intOr(v, 2048)
+	}
+	return c.LocalMemoryResultMaxByteCount()
+}
+
+// AgentToolResultMaxByteCount returns the non-memory tool result size cap for
+// the given agent, falling back to the global LocalToolResultMaxByteCount().
+func (c Config) AgentToolResultMaxByteCount(a AgentConfig) int {
+	if a.Limits != nil && a.Limits.ToolResultMaxBytes != nil {
+		v := *a.Limits.ToolResultMaxBytes
+		if v < 0 {
+			return 0
+		}
+		return intOr(v, 20000)
+	}
+	return c.LocalToolResultMaxByteCount()
+}
+
+// AgentPerceptInjectMaxCount returns the percept injection count cap for the
+// given agent, falling back to the global PerceptInjectMaxCount().
+func (c Config) AgentPerceptInjectMaxCount(a AgentConfig) int {
+	if a.Limits != nil && a.Limits.PerceptInjectMax != nil {
+		v := *a.Limits.PerceptInjectMax
+		if v < 0 {
+			return 0
+		}
+		return intOr(v, 25)
+	}
+	return c.PerceptInjectMaxCount()
+}
+
+// AgentPerceptInjectMaxByteCount returns the percept injection byte cap for the
+// given agent, falling back to the global PerceptInjectMaxByteCount().
+func (c Config) AgentPerceptInjectMaxByteCount(a AgentConfig) int {
+	if a.Limits != nil && a.Limits.PerceptInjectMaxBytes != nil {
+		v := *a.Limits.PerceptInjectMaxBytes
+		if v < 0 {
+			return 0
+		}
+		return intOr(v, 2048)
+	}
+	return c.PerceptInjectMaxByteCount()
+}
+
+// AgentPerceptRelevanceGateEnabled returns whether relevance gating is active for
+// the given agent, falling back to the global PerceptRelevanceGateEnabled().
+func (c Config) AgentPerceptRelevanceGateEnabled(a AgentConfig) bool {
+	if a.Limits != nil && a.Limits.PerceptRelevanceGate != nil {
+		return *a.Limits.PerceptRelevanceGate
+	}
+	return c.PerceptRelevanceGateEnabled()
+}
+
+// AgentMaxToolIterations returns the tool-call chain limit for the given agent.
+// Returns 0 to signal "unlimited" when the value resolves to negative.
+// Default: 20.
+//
+// When neither the per-agent limits.max_tool_iterations nor the global
+// local_max_tool_iterations is explicitly set and context_window_tokens is
+// configured on the agent, the cap is auto-derived as max(5, ContextWindowTokens/4096).
+func (c Config) AgentMaxToolIterations(a AgentConfig) int {
+	if a.Limits != nil && a.Limits.MaxToolIterations != nil {
+		v := *a.Limits.MaxToolIterations
+		if v < 0 {
+			return 0 // unlimited
+		}
+		return intOr(v, 20)
+	}
+	if c.LocalMaxToolIterations < 0 {
+		return 0 // unlimited
+	}
+	if c.LocalMaxToolIterations > 0 {
+		return c.LocalMaxToolIterations
+	}
+	// Auto-derive from context_window_tokens when no explicit global override.
+	if ctw := c.AgentContextWindowTokens(a); ctw > 0 {
+		cap := ctw / 4096
+		if cap < 5 {
+			cap = 5
+		}
+		return cap
+	}
+	return 20 // built-in default
+}
+
+// AgentTurnTimeout returns the per-turn timeout for the given agent.
+// Returns 0 when the agent has configured no timeout (-1). Default: 10 minutes.
+func (c Config) AgentTurnTimeout(a AgentConfig) time.Duration {
+	if a.Limits != nil && a.Limits.TurnTimeoutSecs != nil {
+		v := *a.Limits.TurnTimeoutSecs
+		if v < 0 {
+			return 0 // no timeout
+		}
+		if v > 0 {
+			return time.Duration(v) * time.Second
+		}
+	}
+	return 10 * time.Minute
+}
+
+// AgentToolTimeout returns the per-individual-tool timeout for the given agent.
+// Returns 0 when set to -1 (no timeout). Default: 120 s.
+func (c Config) AgentToolTimeout(a AgentConfig) time.Duration {
+	if a.Limits != nil && a.Limits.ToolTimeoutSecs != nil {
+		v := *a.Limits.ToolTimeoutSecs
+		if v < 0 {
+			return 0 // no per-tool timeout
+		}
+		if v > 0 {
+			return time.Duration(v) * time.Second
+		}
+	}
+	return 2 * time.Minute // default 2 min
+}
+
+// intOr returns v when v > 0, otherwise returns def.
+func intOr(v, def int) int {
+	if v > 0 {
+		return v
+	}
+	return def
+}
+
+// ShowReasoningDefault returns the configured default for reasoning visibility
+// (false when unset, i.e. hide reasoning by default).
+func (c Config) ShowReasoningDefault() bool {
+	if c.ShowReasoning == nil {
+		return false
+	}
+	return *c.ShowReasoning
+}
+
+// StickyEscalationEnabled returns true when router-triggered escalations
+// should be kept sticky across turns (the default). Returns false only when
+// explicitly disabled via sticky_escalation: false in config.
+func (c Config) StickyEscalationEnabled() bool {
+	if c.StickyEscalation == nil {
+		return true
+	}
+	return *c.StickyEscalation
+}
+
+// EffectiveMCPServers returns the enabled MCPServerConfig entries for the named
+// agent. It resolves the agent's MCPServers name list against the top-level
+// MCPServers array, skipping unknown names and disabled entries.
+func (c Config) EffectiveMCPServers(agentName string) []MCPServerConfig {
+	// Find the agent's MCP server name list.
+	var refs []string
+	for _, ac := range c.effectiveAgents() {
+		if strings.EqualFold(ac.Name, agentName) {
+			refs = ac.MCPServers
+			break
+		}
+	}
+	if len(refs) == 0 {
+		return nil
+	}
+
+	// Build a fast lookup of top-level MCP server configs.
+	byName := make(map[string]MCPServerConfig, len(c.MCPServers))
+	for _, ms := range c.MCPServers {
+		byName[strings.ToLower(ms.Name)] = ms
+	}
+
+	result := make([]MCPServerConfig, 0, len(refs))
+	for _, ref := range refs {
+		ms, ok := byName[strings.ToLower(ref)]
+		if !ok || !ms.IsEnabled() {
+			continue
+		}
+		result = append(result, ms)
+	}
+	return result
+}
+
+// UpsertMCPServer normalises sc (auth="none" → "") and writes it into
+// cfg.MCPServers: replacing the entry whose Name matches case-insensitively,
+// or appending sc as a new entry. Returns true when an existing entry was
+// replaced, false when sc was appended. This is the single implementation
+// shared by the TUI wizard, the inline "/mcp add" command, and the headless
+// "milk config mcp add" CLI subcommand — callers must not duplicate this
+// dedup/normalisation logic.
+func UpsertMCPServer(cfg *Config, sc MCPServerConfig) bool {
+	if strings.EqualFold(sc.Auth, "none") {
+		sc.Auth = ""
+	}
+	for i, existing := range cfg.MCPServers {
+		if strings.EqualFold(existing.Name, sc.Name) {
+			cfg.MCPServers[i] = sc
+			return true
+		}
+	}
+	cfg.MCPServers = append(cfg.MCPServers, sc)
+	return false
+}
+
+// EffectiveToolAgents returns the merged list of peer-agent tool entries for the
+// named caller agent. It starts with the global AgentTools list, applies
+// per-agent overrides from the caller's Tools field (replacing global entries by
+// name and appending new ones), then filters out:
+//   - entries with Agent == callerName (cycle guard)
+//   - entries whose Agent name is not found in effectiveAgents()
+//   - entries where !IsEnabled()
+func (c Config) EffectiveToolAgents(callerName string) []AgentToolEntry {
+	// Start with a copy of the global list.
+	result := make([]AgentToolEntry, len(c.AgentTools))
+	copy(result, c.AgentTools)
+
+	// Find caller's per-agent config and apply overrides.
+	for _, ac := range c.Agents {
+		if !strings.EqualFold(ac.Name, callerName) {
+			continue
+		}
+		for _, te := range ac.Tools {
+			replaced := false
+			for i, existing := range result {
+				if strings.EqualFold(existing.Agent, te.Agent) {
+					result[i] = te
+					replaced = true
+					break
+				}
+			}
+			if !replaced {
+				result = append(result, te)
+			}
+		}
+		break
+	}
+
+	// Build a set of known agent names for fast lookup.
+	effectiveNames := make(map[string]bool)
+	for _, ac := range c.effectiveAgents() {
+		effectiveNames[strings.ToLower(ac.Name)] = true
+	}
+
+	// Filter: cycle guard, unknown agents, disabled entries.
+	filtered := result[:0:0]
+	for _, te := range result {
+		if strings.EqualFold(te.Agent, callerName) {
+			continue // cycle guard
+		}
+		if !effectiveNames[strings.ToLower(te.Agent)] {
+			continue // silently drop unknown agent names
+		}
+		if !te.IsEnabled() {
+			continue
+		}
+		filtered = append(filtered, te)
+	}
+	return filtered
+}
+
+// effectiveAgents returns Agents with the built-in claude-cli entry appended
+// if no entry named "claude" already exists. This ensures there is always a
+// claude-cli agent available without requiring it to be in every config file.
+func (c Config) effectiveAgents() []AgentConfig {
+	for _, a := range c.Agents {
+		if strings.EqualFold(a.Name, "claude") {
+			return c.Agents
+		}
+	}
+	return append(c.Agents, defaultCLIAgent())
+}
+
+// ActiveAgent returns the resolved AgentConfig to use as the primary agent.
+// When agent is set by name, any entry type is accepted — including subprocess
+// providers (subprocess, aider-cli) — so they can be used as the primary.
+// The fallback scan still skips subprocess entries so an unconfigured setup
+// doesn't accidentally select one.
+func (c Config) ActiveAgent() AgentConfig {
+	agents := c.effectiveAgents()
+	if c.Agent != "" {
+		for _, a := range agents {
+			if strings.EqualFold(a.Name, c.Agent) {
+				return a // explicit name: always honour, even subprocess providers
+			}
+		}
+	}
+	for _, a := range agents {
+		if !a.IsExternalProcess() {
+			return a
+		}
+	}
+	return AgentConfig{}
+}
+
+// AgentByName looks up an agent by name (case-insensitive), including the
+// built-in claude-cli entry. Reports false if no agent with that name exists.
+func (c Config) AgentByName(name string) (AgentConfig, bool) {
+	for _, a := range c.effectiveAgents() {
+		if strings.EqualFold(a.Name, name) {
+			return a, true
+		}
+	}
+	return AgentConfig{}, false
+}
+
+// EscalationAgentConfig returns the AgentConfig for the escalation backend.
+// Defaults to the built-in claude-cli entry when EscalationAgent is empty or "claude".
+func (c Config) EscalationAgentConfig() AgentConfig {
+	name := strings.TrimSpace(c.EscalationAgent)
+	if name == "" {
+		name = "claude"
+	}
+	for _, a := range c.effectiveAgents() {
+		if strings.EqualFold(a.Name, name) {
+			return a
+		}
+	}
+	// Named agent not found — fall back to claude-cli default.
+	return defaultCLIAgent()
+}
+
+// HasInferenceAgent reports whether the user has configured at least one
+// non-claude-cli agent backend. Used by the TUI to decide whether to show
+// setup hints.
+func (c Config) HasInferenceAgent() bool {
+	for _, a := range c.Agents {
+		if !a.IsCLI() {
+			return true
+		}
+	}
+	return false
+}
+
+// CLIDebugLogPath returns the path for the Claude raw NDJSON debug log.
+func CLIDebugLogPath() (string, error) {
+	d, err := Dir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(d, debugLogFilename("claude_debug.ndjson")), nil
+}
+
+// LocalDebugLogPath returns the path for the local agent raw SSE debug log.
+func LocalDebugLogPath() (string, error) {
+	d, err := Dir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(d, debugLogFilename("local_debug.log")), nil
+}
+
+// SubprocessDebugLogPath returns the path for the subprocess agent raw stdout debug log.
+func SubprocessDebugLogPath() (string, error) {
+	d, err := Dir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(d, debugLogFilename("subprocess_debug.log")), nil
+}
+
+var debugLogFilenamePrefix string
+
+func debugLogFilename(name string) string {
+	return debugLogFilenamePrefix + name
+}
+
+func SetDebugLogFilenamePrefixForTest(prefix string) func() {
+	previous := debugLogFilenamePrefix
+	debugLogFilenamePrefix = prefix
+	return func() { debugLogFilenamePrefix = previous }
+}
+
+func Dir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".milk"), nil
+}
+
+// MCPOAuthDir returns the directory for MCP OAuth token storage (~/.milk/mcp_oauth).
+func MCPOAuthDir() (string, error) {
+	d, err := Dir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(d, "mcp_oauth"), nil
+}
+
+// ModelsDevCachePath returns the path to the cached models.dev catalog
+// (~/.milk/models_dev.json), used by AgentContextWindowTokens's fallback.
+func ModelsDevCachePath() (string, error) {
+	d, err := Dir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(d, "models_dev.json"), nil
+}
+
+// OtelDir returns the directory for OTel signal files (~/.milk/otel).
+func OtelDir() (string, error) {
+	d, err := Dir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(d, "otel"), nil
+}
+
+// MilkLogPath returns the path for the milk log file (~/.milk/otel/milk.log).
+func MilkLogPath() (string, error) {
+	d, err := OtelDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(d, "milk.log"), nil
+}
+
+// HistoryPath returns the readline history file path for the given cwd.
+func HistoryPath(cwd string) (string, error) {
+	dir, err := Dir()
+	if err != nil {
+		return "", err
+	}
+	histDir := filepath.Join(dir, "history")
+	if err := os.MkdirAll(histDir, 0o700); err != nil {
+		return "", err
+	}
+	hash := fmt.Sprintf("%x", md5.Sum([]byte(cwd))) //nolint:gosec
+	return filepath.Join(histDir, hash+".txt"), nil
+}
+
+// LoadWithLocal returns the global config, the local config (if any), and the
+// merged result. The local config takes priority via DeepMerge. If no local
+// config exists, merged == global. All three are returned so callers can
+// display source annotations (config show --sources).
+func LoadWithLocal() (global, local, merged Config, hasLocal bool, err error) {
+	// Load global config (handles MILK_CONFIG env override, defaults, backup).
+	merged, err = Load()
+	if err != nil {
+		return merged, Config{}, merged, false, err
+	}
+	global = merged
+
+	// Check for local config.
+	localPath, pathErr := LocalConfigPath()
+	if pathErr != nil {
+		return global, Config{}, global, false, nil
+	}
+	localData, readErr := os.ReadFile(localPath)
+	if readErr != nil {
+		if os.IsNotExist(readErr) {
+			return global, Config{}, global, false, nil
+		}
+		return global, Config{}, global, false, fmt.Errorf("reading local config %s: %w", localPath, readErr)
+	}
+
+	local = defaults()
+	if parseErr := json.Unmarshal(localData, &local); parseErr != nil {
+		return global, Config{}, global, false, fmt.Errorf("parsing local config %s: %w", localPath, parseErr)
+	}
+
+	merged = DeepMerge(global, local)
+	return global, local, merged, true, nil
+}
+
+// LoadMerged is a convenience wrapper that returns only the merged config.
+// Equivalent to the old Load() behavior but with local overlay support.
+func LoadMerged() (Config, error) {
+	_, _, merged, _, err := LoadWithLocal()
+	return merged, err
+}
+
+func Load() (Config, error) {
+	if p := os.Getenv("MILK_CONFIG"); p != "" {
+		return LoadFrom(p)
+	}
+	dir, err := Dir()
+	if err != nil {
+		return defaults(), err
+	}
+
+	path := filepath.Join(dir, "config.json")
+	if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
+		cfg := defaults()
+		_ = Save(cfg)
+		return cfg, nil
+	}
+	return LoadFrom(path)
+}
+
+// configBackupSuffix names the last-known-good copy of a config file,
+// refreshed on every successful Save or successful parse. If the primary
+// file is later found corrupted — e.g. by a malformed automated edit —
+// LoadFrom falls back to this backup instead of leaving milk unable to
+// start.
+const configBackupSuffix = ".bak"
+
+// ErrConfigRecovered indicates the primary config file failed to parse but
+// its backup (the last config that parsed successfully) was used instead.
+// The returned Config is the backup's content and is safe to use — callers
+// should surface Error() as a warning rather than treating this as fatal.
+type ErrConfigRecovered struct {
+	Path     string // path to the primary config file
+	ParseErr error  // the original parse error on Path
+}
+
+func (e *ErrConfigRecovered) Error() string {
+	return fmt.Sprintf("%s was invalid (%v) — recovered from backup; run \"milk config open\" to fix or replace it", e.Path, e.ParseErr)
+}
+
+func (e *ErrConfigRecovered) Unwrap() error { return e.ParseErr }
+
+// LoadFrom loads a config from the given explicit path, merging over
+// defaults. On a parse error it falls back to path's backup (see
+// configBackupSuffix) before giving up, returning *ErrConfigRecovered
+// rather than a hard error when the fallback succeeds.
+func LoadFrom(path string) (Config, error) {
+	cfg := defaults()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return cfg, fmt.Errorf("loading config from %s: %w", path, err)
+	}
+	if parseErr := json.Unmarshal(data, &cfg); parseErr != nil {
+		wrapped := fmt.Errorf("parsing config %s: %w", path, parseErr)
+		if bakCfg, bakErr := loadConfigBackup(path); bakErr == nil {
+			return bakCfg, &ErrConfigRecovered{Path: path, ParseErr: wrapped}
+		}
+		return defaults(), wrapped
+	}
+	saveConfigBackup(path, data)
+	return cfg, nil
+}
+
+// loadConfigBackup reads and parses path's backup copy.
+func loadConfigBackup(path string) (Config, error) {
+	cfg := defaults()
+	data, err := os.ReadFile(path + configBackupSuffix)
+	if err != nil {
+		return cfg, err
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
+}
+
+// saveConfigBackup best-effort refreshes path's backup copy with data (bytes
+// that were just written or successfully parsed). Failures are ignored —
+// the backup is a safety net, not a guarantee.
+func saveConfigBackup(path string, data []byte) {
+	_ = os.WriteFile(path+configBackupSuffix, data, 0o600)
+}
+
+// ValidationWarning describes a configuration problem found at startup.
+type ValidationWarning struct {
+	Agent   string // agent name (empty = global)
+	Message string
+}
+
+func (w ValidationWarning) String() string {
+	if w.Agent == "" {
+		return w.Message
+	}
+	return fmt.Sprintf("agent %q: %s", w.Agent, w.Message)
+}
+
+// knownProviders is the set of built-in provider strings (lowercased).
+var knownProviders = map[string]bool{
+	"":           true, // "" == local
+	"local":      true,
+	"bedrock":    true,
+	"claude-cli": true,
+	"aider-cli":  true,
+	"subprocess": true,
+}
+
+// requiresURL returns true for providers that need an HTTP url.
+func requiresURL(p string) bool {
+	switch strings.ToLower(strings.TrimSpace(p)) {
+	case "claude-cli", "aider-cli", "subprocess":
+		return false
+	default:
+		return true
+	}
+}
+
+// requiresAuth returns true for providers that need api_key or token_cmd.
+func requiresAuth(p string) bool {
+	switch strings.ToLower(strings.TrimSpace(p)) {
+	case "", "local", "bedrock", "claude-cli", "aider-cli", "subprocess":
+		return false
+	default: // bearer or any custom bearer-style name
+		return true
+	}
+}
+
+// Validate checks the loaded configuration for common misconfigurations and
+// returns a slice of human-readable warnings. It never hard-fails; the caller
+// decides how to surface them (stderr at startup, TUI transcript, etc.).
+func Validate(cfg Config) []ValidationWarning {
+	var ws []ValidationWarning
+	warn := func(agent, msg string) {
+		ws = append(ws, ValidationWarning{Agent: agent, Message: msg})
+	}
+
+	effective := cfg.effectiveAgents()
+
+	for _, a := range effective {
+		p := strings.ToLower(strings.TrimSpace(a.Provider))
+
+		// Unknown provider string (skip the built-in claude placeholder).
+		if a.Name != "claude" || a.Provider != "" {
+			if !knownProviders[p] {
+				// custom bearer-style names are acceptable — only warn for obvious typos.
+				// We can't distinguish "mybearer" from a typo without more context,
+				// so we skip this check for non-empty unknown strings.
+				_ = p
+			}
+		}
+
+		// Both prompt and prompt_file set: prompt_file wins; warn so the user knows.
+		if a.Prompt != "" && a.PromptFile != "" {
+			warn(a.Name, "both prompt and prompt_file are set — prompt_file takes precedence")
+		}
+
+		// HTTP providers must have a url.
+		if requiresURL(a.Provider) && a.URL == "" {
+			warn(a.Name, fmt.Sprintf("url is required for provider %q — run /config init or edit config", providerDisplay(a.Provider)))
+		}
+
+		// Auth-requiring providers must have api_key or token_cmd.
+		if requiresAuth(a.Provider) && a.APIKey == "" && a.TokenCmd == "" {
+			warn(a.Name, fmt.Sprintf("provider %q requires api_key or token_cmd — run /config init or edit config", providerDisplay(a.Provider)))
+		}
+	}
+
+	// Validate MCP server entries.
+	mcpNames := make(map[string]bool, len(cfg.MCPServers))
+	for _, ms := range cfg.MCPServers {
+		if ms.Name == "" {
+			warn("", "mcp_servers entry missing name")
+			continue
+		}
+		if mcpNames[ms.Name] {
+			warn("", fmt.Sprintf("mcp_servers: duplicate name %q", ms.Name))
+		}
+		mcpNames[ms.Name] = true
+		isStdio := strings.ToLower(ms.Transport) == "stdio"
+		if ms.URL == "" && !isStdio {
+			warn("", fmt.Sprintf("mcp_servers %q: url is required", ms.Name))
+		}
+		if isStdio && ms.Command == "" {
+			warn("", fmt.Sprintf("mcp_servers %q: command is required for stdio transport", ms.Name))
+		}
+		switch strings.ToLower(ms.Auth) {
+		case "", "none", "bearer", "token_cmd", "oauth":
+		default:
+			warn("", fmt.Sprintf("mcp_servers %q: unknown auth %q (valid: none, bearer, token_cmd, oauth)", ms.Name, ms.Auth))
+		}
+		switch strings.ToLower(ms.Transport) {
+		case "", "http", "stdio":
+		default:
+			warn("", fmt.Sprintf("mcp_servers %q: unknown transport %q (valid: http, stdio)", ms.Name, ms.Transport))
+		}
+	}
+
+	// Validate per-agent MCP server references.
+	for _, a := range effective {
+		for _, ref := range a.MCPServers {
+			if !mcpNames[ref] {
+				warn(a.Name, fmt.Sprintf("mcp_servers reference %q not found in top-level mcp_servers list", ref))
+			}
+		}
+	}
+
+	// Validate agent selector resolves.
+	if cfg.Agent != "" {
+		found := false
+		for _, a := range effective {
+			if strings.EqualFold(a.Name, cfg.Agent) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			warn("", fmt.Sprintf("agent %q not found in agents list — run /config init or edit config", cfg.Agent))
+		}
+	}
+
+	// Validate escalation_agent selector resolves (when explicitly set).
+	if cfg.EscalationAgent != "" && !strings.EqualFold(cfg.EscalationAgent, "claude") {
+		found := false
+		for _, a := range effective {
+			if strings.EqualFold(a.Name, cfg.EscalationAgent) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			warn("", fmt.Sprintf("escalation_agent %q not found in agents list — run /config init or edit config", cfg.EscalationAgent))
+		}
+	}
+
+	return ws
+}
+
+func providerDisplay(p string) string {
+	if p == "" {
+		return "local"
+	}
+	return p
+}
+
+// InitConfig builds a minimal valid Config from one primary agent entry and an
+// optional escalation agent entry. It sets sensible defaults (default_route,
+// otel) and selects the primary agent by name. The result is ready to Save().
+func InitConfig(primary AgentConfig, escalation *AgentConfig) Config {
+	cfg := defaults()
+	cfg.Agents = []AgentConfig{primary}
+	cfg.Agent = primary.Name
+	if escalation != nil {
+		cfg.Agents = append(cfg.Agents, *escalation)
+		cfg.EscalationAgent = escalation.Name
+	}
+	return cfg
+}
+
+// ShouldCheckUpdate returns true when the update check is enabled and at least
+// 24 hours have passed since the last check.
+func (c Config) ShouldCheckUpdate() bool {
+	if c.UpdateCheck != nil && !*c.UpdateCheck {
+		return false
+	}
+	if c.UpdateLastCheck == "" {
+		return true
+	}
+	last, err := time.Parse(time.RFC3339, c.UpdateLastCheck)
+	if err != nil {
+		return true
+	}
+	return time.Since(last) >= 24*time.Hour
+}
+
+// UpdateCheckIncludePrerelease returns true when the update channel includes
+// pre-release versions (default: true, since all current releases are pre-releases).
+func (c Config) UpdateCheckIncludePrerelease() bool {
+	return c.UpdateChannel != "stable"
+}
+
+// LoopDetection returns the loop.Config derived from the LoopDetection config
+// section. When LoopDetection is nil, returns a default config with detection
+// enabled.
+func (c Config) LoopDetectionCfg() loop.Config {
+	cfg := loop.Config{Enabled: true}
+	if ld := c.LoopDetection; ld != nil {
+		if ld.Enabled != nil {
+			cfg.Enabled = *ld.Enabled
+		}
+		if ld.MaxConsecutiveSimilarResponses > 0 {
+			cfg.MaxConsecutiveSimilarResponses = ld.MaxConsecutiveSimilarResponses
+		}
+		if ld.ResponseSimilarityThreshold != nil {
+			cfg.ResponseSimilarityThreshold = *ld.ResponseSimilarityThreshold
+		}
+		if ld.TokenVelocityWindowSeconds > 0 {
+			cfg.TokenVelocitySeconds = ld.TokenVelocityWindowSeconds
+		}
+		if ld.TokenVelocityThreshold != nil {
+			cfg.TokenVelocityThreshold = *ld.TokenVelocityThreshold
+		}
+		if ld.MaxSilentBurnTokens != nil {
+			cfg.MaxSilentBurnTokens = *ld.MaxSilentBurnTokens
+		}
+		if ld.MaxConsecutiveTurnsWithoutUser > 0 {
+			cfg.MaxConsecutiveTurnsWithoutUser = ld.MaxConsecutiveTurnsWithoutUser
+		}
+		if ld.ToolEchoThreshold > 0 {
+			cfg.ToolEchoThreshold = ld.ToolEchoThreshold
+		}
+		if ld.ChunkRepetitionThreshold > 0 {
+			cfg.ChunkRepetitionThreshold = ld.ChunkRepetitionThreshold
+		}
+		if ld.ChunkWindowSize > 0 {
+			cfg.ChunkWindowSize = ld.ChunkWindowSize
+		}
+		if ld.ReasoningChunkRepetitionThreshold > 0 {
+			cfg.ReasoningChunkRepetitionThreshold = ld.ReasoningChunkRepetitionThreshold
+		}
+		if ld.ChunkRepetitionMinScatteredLength > 0 {
+			cfg.ChunkRepetitionMinScatteredLength = ld.ChunkRepetitionMinScatteredLength
+		}
+		if ld.ReasoningMaxConsecutiveSimilarResponses > 0 {
+			cfg.ReasoningMaxConsecutiveSimilarResponses = ld.ReasoningMaxConsecutiveSimilarResponses
+		}
+		if ld.AutoInterrupt != nil {
+			cfg.AutoInterrupt = *ld.AutoInterrupt
+		}
+	}
+	return cfg
+}
+
+// SaveScope writes the config to the specified scope.
+// scope = "global" writes to ~/.milk/config.json (default).
+// scope = "local"  writes to .milk/config.json in cwd.
+// Any other value falls back to global.
+func SaveScope(cfg Config, scope string) error {
+	if scope == "local" {
+		return SaveLocal(cfg)
+	}
+	return Save(cfg)
+}
+
+func Save(cfg Config) error {
+	dir, err := Dir()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return err
+	}
+	saveConfigBackup(path, data)
+	return nil
+}

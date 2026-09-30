@@ -1,0 +1,397 @@
+package local
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+
+	"github.com/scoutme/milk/internal/obs"
+	"github.com/scoutme/milk/internal/workflow"
+)
+
+// responsesRequest is the request body for the OpenAI Responses API (/v1/responses).
+type responsesRequest struct {
+	Model       string           `json:"model"`
+	Input       []responsesInput `json:"input"`
+	Tools       []map[string]any `json:"tools,omitempty"`
+	Stream      bool             `json:"stream"`
+	Temperature float64          `json:"temperature"`
+}
+
+// responsesInput is a single item in the Responses API input array.
+// It covers role-based messages (user/assistant/system), function_call items,
+// and function_call_output items via the union of their fields with omitempty.
+type responsesInput struct {
+	Type      string `json:"type,omitempty"`
+	Role      string `json:"role,omitempty"`
+	Content   string `json:"content,omitempty"`
+	CallID    string `json:"call_id,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
+	Output    string `json:"output,omitempty"`
+}
+
+// responsesEvent is the data payload of a Responses API SSE event.
+type responsesEvent struct {
+	Type        string               `json:"type"`
+	Delta       string               `json:"delta,omitempty"`
+	OutputIndex int                  `json:"output_index"`
+	Item        *responsesOutputItem `json:"item,omitempty"`
+	Response    *responsesUsageBody  `json:"response,omitempty"`
+}
+
+type responsesOutputItem struct {
+	Type   string `json:"type"`
+	CallID string `json:"call_id"`
+	Name   string `json:"name"`
+}
+
+type responsesUsageBody struct {
+	Usage *struct {
+		InputTokens        int64 `json:"input_tokens"`
+		OutputTokens       int64 `json:"output_tokens"`
+		InputTokensDetails *struct {
+			CachedTokens int64 `json:"cached_tokens"`
+		} `json:"input_tokens_details,omitempty"`
+	} `json:"usage,omitempty"`
+}
+
+// messagesToResponses converts a Chat Completions message slice to Responses API input items.
+// assistant tool_calls → function_call items; tool role → function_call_output items.
+func messagesToResponses(msgs []Message) []responsesInput {
+	items := make([]responsesInput, 0, len(msgs))
+	for _, m := range msgs {
+		switch m.Role {
+		case "tool":
+			items = append(items, responsesInput{
+				Type:   "function_call_output",
+				CallID: m.ToolCallID,
+				Output: m.Content,
+			})
+		case "assistant":
+			for _, tc := range m.ToolCalls {
+				items = append(items, responsesInput{
+					Type:      "function_call",
+					CallID:    tc.ID,
+					Name:      tc.Function.Name,
+					Arguments: tc.Function.Arguments,
+				})
+			}
+			if m.Content != "" {
+				items = append(items, responsesInput{Role: "assistant", Content: m.Content})
+			}
+		default: // user, system
+			items = append(items, responsesInput{Role: m.Role, Content: m.Content})
+		}
+	}
+	return items
+}
+
+// convertToolsToResponsesFormat converts Chat Completions tool schemas
+// (nested under "function") to the flat Responses API format.
+func convertToolsToResponsesFormat(tools []map[string]any) []map[string]any {
+	result := make([]map[string]any, 0, len(tools))
+	for _, t := range tools {
+		fn, ok := t["function"].(map[string]any)
+		if !ok {
+			result = append(result, t)
+			continue
+		}
+		flat := map[string]any{"type": "function"}
+		for k, v := range fn {
+			flat[k] = v
+		}
+		result = append(result, flat)
+	}
+	return result
+}
+
+// responsesStreamCompletion sends a streaming request to the OpenAI Responses API.
+func (a *Agent) responsesStreamCompletion(ctx context.Context, msgs []Message, tools []map[string]any, out io.Writer) (string, string, []toolCall, bool, string, error) {
+	req := responsesRequest{
+		Model:       a.model,
+		Input:       messagesToResponses(msgs),
+		Tools:       convertToolsToResponsesFormat(tools),
+		Stream:      true,
+		Temperature: 0.2,
+	}
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return "", "", nil, false, "", err
+	}
+	if a.onRequestSize != nil {
+		a.onRequestSize(int64(len(body)))
+	}
+	if a.logContext {
+		obs.LogPayload(a.inferenceURL(), body, a.jobAttrs()...)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.inferenceURL(), bytes.NewReader(body))
+	if err != nil {
+		return "", "", nil, false, "", err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	inferenceStart := time.Now()
+	httpResp, err := a.client.Do(httpReq)
+	if err != nil {
+		obs.Inc(ctx, inferenceScope, "milk.inference.errors",
+			attribute.String("model", a.model),
+			attribute.String("agent", a.logRole()),
+			attribute.String("kind", "http"),
+		)
+		a.logWarn("inference request failed",
+			"model", a.model, "agent", a.logRole(),
+			"err", err.Error(), "elapsed", time.Since(inferenceStart).String(),
+			"retryable", workflow.IsRetryableTurnError(err))
+		return "", "", nil, false, "", fmt.Errorf("inference server unreachable: %w", err)
+	}
+	defer httpResp.Body.Close()
+
+	if httpResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(httpResp.Body)
+		obs.Inc(ctx, inferenceScope, "milk.inference.errors",
+			attribute.String("model", a.model),
+			attribute.String("agent", a.logRole()),
+			attribute.String("kind", "http"),
+		)
+		a.logWarn("inference request returned non-200",
+			"model", a.model, "agent", a.logRole(),
+			"status", httpResp.StatusCode, "body", string(b),
+			"elapsed", time.Since(inferenceStart).String())
+		return "", "", nil, false, "", fmt.Errorf("inference server error %d: %s", httpResp.StatusCode, b)
+	}
+
+	det := NewStreamDetector(a.detectedFormat)
+	partialTools := map[int]*toolCall{}
+	var textBuf strings.Builder
+
+	scanner := bufio.NewScanner(httpResp.Body)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	toolCalls, promptTokens, completionTokens, cacheRead, err := a.scanResponsesSSE(scanner, det, partialTools, &textBuf, out)
+	if err != nil {
+		return "", "", nil, false, "", err
+	}
+	// No tool calls and no content: a degenerate/empty completion. Flag it so
+	// Run() can fall back to a summary of this turn's tool activity instead
+	// of persisting (or discarding) a blank assistant message.
+	emptyFallback := textBuf.Len() == 0 && len(toolCalls) == 0 && !det.InBlock() && det.RawBlock() == ""
+
+	role := a.logRole()
+	obs.RecordDuration(ctx, inferenceScope, "milk.inference.latency_ms", time.Since(inferenceStart),
+		attribute.String("model", a.model),
+		attribute.String("agent", role),
+		attribute.String("provider", "responses"),
+	)
+	// See the matching comment in streamCompletion (local.go): promptTokens here
+	// is the TOTAL input including cached tokens, not additive with cacheRead —
+	// normalize to fresh-only so it matches the convention every downstream
+	// consumer (session, obs, status bar, memory panel) already assumes.
+	freshPrompt := max(promptTokens-cacheRead, 0)
+	// See the matching comment in streamCompletionOnce (local.go):
+	// background-job clones record their token totals once at drain time,
+	// never per-request (double-counting + parent-role mis-tagging).
+	if a.jobID == "" {
+		obs.RecordTokens(ctx, a.model, role, freshPrompt, completionTokens)
+	}
+	if a.onTokens != nil {
+		// cacheCreation is always 0: the Responses API, like Chat Completions,
+		// reports cache reads only. See input_tokens_details.cached_tokens
+		// (inferred from OpenAI's public Responses API docs — not live-verified
+		// against a Responses-API provider; safe because it's ignored when absent).
+		a.onTokens(a.model, role, freshPrompt, completionTokens, cacheRead, 0)
+	}
+
+	if det.Format != ToolFormatUnknown {
+		a.detectedFormat = det.Format
+	}
+	text, fallbackRaw, tcs, err := a.classifyStreamResult(det, toolCalls, textBuf.String(), out)
+	return text, fallbackRaw, tcs, emptyFallback, "", err
+}
+
+// scanResponsesSSE reads SSE lines from a Responses API stream, dispatching on
+// the "type" field in each data payload.
+func (a *Agent) scanResponsesSSE(
+	scanner *bufio.Scanner,
+	det *StreamDetector,
+	partialTools map[int]*toolCall,
+	textBuf *strings.Builder,
+	out io.Writer,
+) ([]toolCall, int64, int64, int64, error) {
+	dbg := a.debugLog
+	var promptTokens, completionTokens, cacheRead int64
+
+	// See the matching comment in scanSSE (local.go) — same observability gap,
+	// same fix: a mid-stream read failure used to return bare from
+	// scanner.Err() with no trace in milk.log, and an idle-but-open connection
+	// looked identical to dead silence in the log for however long it hung.
+	streamStartedAt := time.Now()
+	var lines atomic.Int64
+	var lastLineAtNano atomic.Int64
+	lastLineAtNano.Store(streamStartedAt.UnixNano())
+	heartbeatDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(streamIdleLogInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-heartbeatDone:
+				return
+			case <-ticker.C:
+				idle := time.Since(time.Unix(0, lastLineAtNano.Load()))
+				if idle >= streamIdleLogInterval {
+					a.logWarn("stream idle",
+						"model", a.model, "agent", a.logRole(),
+						"lines_scanned", lines.Load(),
+						"elapsed_since_start", time.Since(streamStartedAt).String(),
+						"elapsed_since_last_chunk", idle.String())
+				}
+			}
+		}
+	}()
+	defer close(heartbeatDone)
+
+	for scanner.Scan() {
+		lines.Add(1)
+		lastLineAtNano.Store(time.Now().UnixNano())
+		line := scanner.Text()
+		if dbg != nil {
+			fmt.Fprintln(dbg, line) //nolint:errcheck
+		}
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			break
+		}
+		var ev responsesEvent
+		if err := json.Unmarshal([]byte(data), &ev); err != nil {
+			if dbg != nil {
+				fmt.Fprintf(dbg, "[skip:json-error] %v | raw: %s\n", err, data) //nolint:errcheck
+			}
+			continue
+		}
+		switch ev.Type {
+		case "response.output_text.delta":
+			processContentToken(ev.Delta, det, textBuf, out)
+		case "response.output_item.added":
+			if ev.Item != nil && ev.Item.Type == "function_call" {
+				partialTools[ev.OutputIndex] = &toolCall{
+					ID:   ev.Item.CallID,
+					Type: "function",
+					Function: toolCallFunction{
+						Name: ev.Item.Name,
+					},
+				}
+			}
+		case "response.function_call_arguments.delta":
+			if pt, ok := partialTools[ev.OutputIndex]; ok {
+				pt.Function.Arguments += ev.Delta
+			}
+		case "response.completed":
+			if ev.Response != nil && ev.Response.Usage != nil {
+				promptTokens = ev.Response.Usage.InputTokens
+				completionTokens = ev.Response.Usage.OutputTokens
+				if ev.Response.Usage.InputTokensDetails != nil {
+					cacheRead = ev.Response.Usage.InputTokensDetails.CachedTokens
+				}
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		a.logWarn("stream read failed",
+			"model", a.model, "agent", a.logRole(),
+			"err", err.Error(),
+			"lines_scanned", lines.Load(),
+			"elapsed_since_start", time.Since(streamStartedAt).String(),
+			"elapsed_since_last_chunk", time.Since(time.Unix(0, lastLineAtNano.Load())).String(),
+			"content_bytes", textBuf.Len(),
+			"tool_call_fragments", len(partialTools),
+			"retryable", workflow.IsRetryableTurnError(err))
+		return nil, 0, 0, 0, err
+	}
+	a.logDebug("stream read completed",
+		"model", a.model, "agent", a.logRole(),
+		"lines_scanned", lines.Load(),
+		"elapsed", time.Since(streamStartedAt).String(),
+		"content_bytes", textBuf.Len())
+	return collectNativeToolCalls(partialTools), promptTokens, completionTokens, cacheRead, nil
+}
+
+// responsesClassify classifies a prompt using the Responses API (non-streaming).
+func (a *Agent) responsesClassify(ctx context.Context, prompt string) (bool, error) {
+	classifyPrompt := `Respond with exactly one word: "primary" or "escalate".
+Use "escalate" only when the task clearly requires complex multi-file refactoring, architectural design decisions, or deep reasoning beyond coding assistance.
+Use "primary" for shell commands, file reading, grep, simple code questions, debugging, and writing small functions.
+
+Task: ` + prompt
+
+	req := responsesRequest{
+		Model:       a.model,
+		Input:       []responsesInput{{Role: "user", Content: classifyPrompt}},
+		Stream:      false,
+		Temperature: 0,
+	}
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return false, err
+	}
+	if a.logContext {
+		obs.LogPayload(a.inferenceURL()+" [classify]", body, a.jobAttrs()...)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.inferenceURL(), bytes.NewReader(body))
+	if err != nil {
+		return false, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	httpResp, err := a.client.Do(httpReq)
+	if err != nil {
+		return false, fmt.Errorf("inference server unreachable: %w", err)
+	}
+	defer httpResp.Body.Close()
+
+	var result struct {
+		Output []struct {
+			Type    string `json:"type"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
+		Usage *struct {
+			InputTokens  int64 `json:"input_tokens"`
+			OutputTokens int64 `json:"output_tokens"`
+		} `json:"usage,omitempty"`
+	}
+	if err := json.NewDecoder(httpResp.Body).Decode(&result); err != nil {
+		return false, err
+	}
+	if result.Usage != nil {
+		obs.RecordTokens(ctx, a.model, "router", result.Usage.InputTokens, result.Usage.OutputTokens)
+	}
+	for _, item := range result.Output {
+		if item.Type == "message" {
+			for _, c := range item.Content {
+				if c.Type == "output_text" {
+					return strings.HasPrefix(strings.TrimSpace(strings.ToLower(c.Text)), "escalate"), nil
+				}
+			}
+		}
+	}
+	return false, nil
+}

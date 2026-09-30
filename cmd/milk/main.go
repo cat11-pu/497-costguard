@@ -1,0 +1,2596 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/spf13/cobra"
+	"go.opentelemetry.io/otel/attribute"
+
+	"github.com/scoutme/milk/internal/updater"
+
+	"github.com/scoutme/milk/eval"
+	"github.com/scoutme/milk/internal/agent/aider"
+	"github.com/scoutme/milk/internal/agent/claude"
+	"github.com/scoutme/milk/internal/agent/local"
+	"github.com/scoutme/milk/internal/agent/smolagent"
+	"github.com/scoutme/milk/internal/agent/subprocess"
+	"github.com/scoutme/milk/internal/claudesettings"
+	"github.com/scoutme/milk/internal/config"
+	"github.com/scoutme/milk/internal/diff"
+	"github.com/scoutme/milk/internal/escalation"
+	"github.com/scoutme/milk/internal/loop"
+	"github.com/scoutme/milk/internal/mcp"
+	"github.com/scoutme/milk/internal/memory"
+	"github.com/scoutme/milk/internal/modelsdev"
+	"github.com/scoutme/milk/internal/obs"
+	"github.com/scoutme/milk/internal/oversight"
+	"github.com/scoutme/milk/internal/router"
+	"github.com/scoutme/milk/internal/selfdocs"
+	"github.com/scoutme/milk/internal/session"
+	"github.com/scoutme/milk/internal/shelldetect"
+)
+
+const milkScope = "github.com/scoutme/milk"
+
+var (
+	flagEscalate   bool
+	flagPrimary    bool
+	flagNew        bool
+	flagSession    string
+	flagContinue   bool
+	flagList       bool
+	flagListAll    bool
+	flagDrop       bool
+	flagAgent      string // --agent: override primary agent name
+	flagEscalation string // --escalation-agent: override escalation agent name
+	flagLocal      bool   // --local: write to .milk/config.json (project-local)
+	flagGlobal     bool   // --global: write to ~/.milk/config.json (global)
+)
+
+// Set via -ldflags at build time.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
+const errGettingCWD = "getting cwd: %w"
+
+func main() {
+	if err := rootCmd.Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
+var rootCmd = &cobra.Command{
+	Use:   "milk [flags] [prompt]",
+	Short: "Switch models, not context.",
+	Long: `milk lets you move between a local LLM and Claude Code mid-workflow, without
+losing context. The local agent speaks the OpenAI-compatible API — any compliant
+inference server works, local or remote (llama.cpp, Ollama, LM Studio, vLLM, or
+any hosted endpoint).`,
+	Args:         cobra.ArbitraryArgs,
+	SilenceUsage: true,
+	Version:      fmt.Sprintf("%s (commit %s, built %s)", version, commit, date),
+	RunE:         run,
+}
+
+func init() {
+	rootCmd.Flags().BoolVar(&flagEscalate, "escalate", false, "Force route to escalation agent for this turn")
+	rootCmd.Flags().BoolVar(&flagPrimary, "primary", false, "Force route to primary agent for this turn")
+	rootCmd.Flags().BoolVar(&flagNew, "new", false, "Start a new session")
+	rootCmd.Flags().StringVar(&flagSession, "session", "", "Target session by name")
+	rootCmd.Flags().BoolVarP(&flagContinue, "continue", "c", false, "Resume current session (default behavior, explicit alias)")
+	rootCmd.Flags().BoolVar(&flagList, "list", false, "List sessions for current cwd")
+	rootCmd.Flags().BoolVar(&flagListAll, "all", false, "With --list: show all sessions across all directories")
+	rootCmd.Flags().BoolVar(&flagDrop, "drop", false, "Delete the current session")
+	rootCmd.Flags().StringVar(&flagAgent, "agent", "", "Override primary agent (by name)")
+	rootCmd.Flags().StringVar(&flagEscalation, "escalation-agent", "", "Override escalation agent (by name)")
+
+	rootCmd.AddCommand(configCmd)
+	rootCmd.AddCommand(otelCmd)
+	rootCmd.AddCommand(updateCmd)
+	rootCmd.AddCommand(serverCmd)
+	rootCmd.AddCommand(eval.Command())
+}
+
+func run(cmd *cobra.Command, args []string) error {
+	if flagList {
+		return runList(flagListAll)
+	}
+	if flagDrop {
+		return runDrop()
+	}
+
+	prompt := strings.TrimSpace(strings.Join(args, " "))
+
+	cfg, err := config.LoadMerged()
+	startupWarning := ""
+	if err != nil {
+		var recovered *config.ErrConfigRecovered
+		if !errors.As(err, &recovered) {
+			return fmt.Errorf("loading config: %w — fix it by hand (milk config open) or remove it to regenerate defaults", err)
+		}
+		// Recovered from backup: cfg is the last known-good config, not a
+		// hard failure. Warn instead of refusing to start.
+		startupWarning = recovered.Error()
+		fmt.Fprintf(os.Stderr, "%s warning: %s\n", milkTag(), startupWarning)
+	}
+
+	// Apply CLI overrides for agent selection.
+	if flagAgent != "" {
+		cfg.Agent = flagAgent
+	}
+	if flagEscalation != "" {
+		cfg.EscalationAgent = flagEscalation
+	}
+
+	// Wire need expiry config to session package.
+	session.NeedExpiryDuration = time.Duration(cfg.AgentNeedExpiryHours()) * time.Hour
+
+	// Register user-configured shell binaries for the shell-detector heuristic.
+	shelldetect.RegisterBinaries(cfg.ShellBinaries)
+
+	// Load (and, if stale, background-refresh) the models.dev catalog used
+	// by Config.AgentContextWindowTokens's fallback. Never blocks startup.
+	if !cfg.DisableModelsDevLookup {
+		if cachePath, err := config.ModelsDevCachePath(); err == nil {
+			modelsdev.EnsureLoaded(cachePath)
+		}
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf(errGettingCWD, err)
+	}
+
+	if prompt == "" {
+		return runREPL(cfg, cwd, flagNew, flagSession, startupWarning)
+	}
+
+	for _, w := range config.Validate(cfg) {
+		fmt.Fprintf(os.Stderr, "%s config warning: %s\n", milkTag(), w)
+	}
+
+	sess, err := loadSessionForRun(cwd)
+	if err != nil {
+		return fmt.Errorf("loading session: %w", err)
+	}
+
+	sessionStart := time.Now()
+	obsShutdown := initObs(cfg)
+	defer func() {
+		obs.SetGauge(context.Background(), milkScope, "milk.session.duration_ms",
+			time.Since(sessionStart).Milliseconds(),
+		)
+		obsShutdown(context.Background()) //nolint:errcheck
+	}()
+
+	memDir, err := memoryDir()
+	if err != nil {
+		return err
+	}
+	mem, err := memory.NewStore(memDir, sess.ID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s warning: memory store unavailable: %v\n", milkTag(), err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	primaryRunner, localAgent, err := buildPrimaryRunner(ctx, cfg, cwd, sess)
+	if err != nil {
+		return err
+	}
+	escalationRunner, err := buildEscalationRunner(ctx, cfg, cwd, sess)
+	if err != nil {
+		return err
+	}
+
+	localAvail := primaryRunner != nil && primaryRunner.Ping() == nil
+	escalationAvail := escalationRunner != nil && escalationRunner.Ping() == nil
+
+	if !localAvail {
+		fmt.Fprintf(os.Stderr, "%s warning: %s primary agent unreachable\n", milkTag(), cfg.ActiveAgent().Name)
+	}
+	if !escalationAvail {
+		fmt.Fprintf(os.Stderr, "%s warning: escalation agent unavailable\n", milkTag())
+	}
+	if !localAvail && !escalationAvail {
+		return fmt.Errorf("neither primary nor escalation agent is available")
+	}
+
+	// Router uses the local HTTP agent for classification; nil when primary is subprocess.
+	var routeLocalAgent *local.Agent
+	if localAvail && localAgent != nil {
+		routeLocalAgent = localAgent
+	}
+	rtr := router.New(cfg, routeLocalAgent)
+
+	decision, err := rtr.Route(ctx, sess, prompt, flagEscalate, flagPrimary)
+	if err != nil {
+		return fmt.Errorf("routing: %w", err)
+	}
+
+	target := resolveTarget(decision.Target, localAvail, escalationAvail)
+
+	targetLabel := string(target)
+	sourceLabel := turnSourceLabel(flagEscalate, flagPrimary)
+
+	turnStart := time.Now()
+	var turnErr error
+	switch target {
+	case router.TargetLocal:
+		if mem != nil {
+			defer func() {
+				_ = mem.Consolidate()
+				_ = mem.PruneGlobal(cfg.PerceptStoreSizeLimit())
+			}()
+		}
+		turnErr = runPrimary(ctx, cfg, sess, primaryRunner, escalationRunner, mem, prompt, os.Stdout, nil, nil, nil, nil)
+	case router.TargetEscalation:
+		// onWorkflowStart is nil: single-prompt CLI mode has no bubbletea
+		// model to launch a workflow against — see runPrimaryWithSession's
+		// doc comment on the same parameter.
+		turnErr = runEscalation(ctx, cfg, sess, escalationRunner, "", mem, prompt, os.Stdout, nil, nil, nil, nil)
+	default:
+		return fmt.Errorf("unknown routing target: %s", target)
+	}
+
+	obs.Inc(ctx, milkScope, "milk.turns.total",
+		attribute.String("target", targetLabel),
+		attribute.String("source", sourceLabel),
+	)
+	obs.RecordDuration(ctx, milkScope, "milk.turns.latency_ms", time.Since(turnStart),
+		attribute.String("target", targetLabel),
+	)
+	if turnErr != nil {
+		obs.Inc(ctx, milkScope, "milk.turns.errors",
+			attribute.String("target", targetLabel),
+			attribute.String("kind", "inference"),
+		)
+	}
+	return turnErr
+}
+
+// buildPrimaryRunner constructs the TurnRunner for the primary agent role.
+// Also returns the underlying *local.Agent when it exists (needed for the router classifier).
+func buildPrimaryRunner(_ context.Context, cfg config.Config, cwd string, sess *session.Session) (TurnRunner, *local.Agent, error) {
+	primaryAC := cfg.ActiveAgent()
+
+	if primaryAC.IsCLI() {
+		// No cheap classifier is available for a claude-cli primary — the
+		// router already treats a nil *local.Agent as "skip step 4, attempt
+		// primary directly" (see internal/router.Decide), same as it does
+		// for subprocess primaries.
+		cliAgt := newCLIAgent(primaryAC)
+		cliAgt = applyAWSCreds(cfg, cliAgt)
+		cliAgt = cliAgt.WithLogContext(cfg.Otel.LogContext)
+		if dbg, err := openCLIDebugLog(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "%s warning: cannot open claude debug log: %v\n", milkTag(), err)
+		} else if dbg != nil {
+			cliAgt = cliAgt.WithDebugLog(dbg)
+		}
+		var cs *claudesettings.Store
+		if store, err := claudesettings.Open(cwd); err == nil {
+			cs = store
+		}
+		name := primaryAC.Name
+		if name == "" {
+			name = "primary"
+		}
+		r := newCLIRunner(cliAgt, name, permContext{cs: cs, cwd: cwd}, func() inputReader { return newStdinInputReader() })
+		if servers := cfg.EffectiveMCPServers(primaryAC.Name); len(servers) > 0 {
+			r = r.withMCPServers(servers)
+		}
+		return r, nil, nil
+	}
+
+	if primaryAC.IsExternalProcess() && !primaryAC.IsCLI() {
+		var sp *subprocess.Agent
+		switch {
+		case primaryAC.IsSubprocess():
+			if primaryAC.Bin == "" {
+				if scriptPath, scriptErr := ensureSmolagentScript(); scriptErr != nil {
+					fmt.Fprintf(os.Stderr, "%s warning: could not deploy milk-smolagent: %v\n", milkTag(), scriptErr)
+				} else {
+					primaryAC.Bin = scriptPath
+				}
+			}
+			sp = smolagent.New(primaryAC)
+		case primaryAC.IsAiderCLI():
+			sp = aider.New(primaryAC)
+		}
+		if sp == nil {
+			return nil, nil, fmt.Errorf("unsupported subprocess provider: %s", primaryAC.Provider)
+		}
+		sp = sp.WithLogContext(cfg.Otel.LogContext)
+		if dbg, err := openSubprocessDebugLog(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "%s warning: cannot open subprocess debug log: %v\n", milkTag(), err)
+		} else if dbg != nil {
+			sp = sp.WithDebugLog(dbg)
+		}
+		r := newSubprocessRunner(sp, primaryAC.Name)
+		if servers, ts, _ := buildMCPToolSet(context.Background(), cfg, primaryAC.Name); ts != nil {
+			r = r.withMCPToolSet(servers, ts)
+		}
+		return r, nil, nil
+	}
+
+	ac := applyFreshAWSCreds(cfg, primaryAC)
+	la := local.NewFromConfig(ac)
+	if od, err := config.OtelDir(); err == nil {
+		la.WithOtelDir(od)
+	}
+	la.WithLogContext(cfg.Otel.LogContext)
+	la.WithOnTokens(func(model, role string, prompt, completion, cacheRead, cacheCreation int64) {
+		sess.AddTokensFull(model, role, prompt, completion, cacheRead, cacheCreation)
+	})
+	if lp, err := local.OpenPermStore(cwd); err == nil {
+		la.WithPermissions(lp, nil)
+	}
+	la = la.WithSkipPermissions(cliAgentConfig(cfg).DangerouslySkipPermissions)
+	if dbg, err := openLocalDebugLog(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "%s warning: cannot open local debug log: %v\n", milkTag(), err)
+	} else if dbg != nil {
+		la = la.WithDebugLog(dbg)
+	}
+	name := primaryAC.Name
+	if name == "" {
+		name = "primary"
+	}
+	la, mcpErr := attachMCPToolSet(context.Background(), cfg, primaryAC.Name, la)
+	if mcpErr != nil {
+		fmt.Fprintf(os.Stderr, "%s warning: %v\n", milkTag(), mcpErr)
+	}
+	return newLocalRunner(la, name), la, nil
+}
+
+// buildEscalationRunner constructs the TurnRunner for the escalation agent role.
+func buildEscalationRunner(_ context.Context, cfg config.Config, cwd string, sess *session.Session) (TurnRunner, error) {
+	escAC := cfg.EscalationAgentConfig()
+
+	if escAC.IsExternalProcess() && !escAC.IsCLI() {
+		var sp *subprocess.Agent
+		switch {
+		case escAC.IsSubprocess():
+			if escAC.Bin == "" {
+				if scriptPath, scriptErr := ensureSmolagentScript(); scriptErr != nil {
+					fmt.Fprintf(os.Stderr, "%s warning: could not deploy milk-smolagent: %v\n", milkTag(), scriptErr)
+				} else {
+					escAC.Bin = scriptPath
+				}
+			}
+			sp = smolagent.New(escAC)
+		case escAC.IsAiderCLI():
+			sp = aider.New(escAC)
+		}
+		if sp != nil {
+			sp = sp.WithLogContext(cfg.Otel.LogContext)
+			if dbg, err := openSubprocessDebugLog(cfg); err != nil {
+				fmt.Fprintf(os.Stderr, "%s warning: cannot open subprocess debug log: %v\n", milkTag(), err)
+			} else if dbg != nil {
+				sp = sp.WithDebugLog(dbg)
+			}
+			r := newSubprocessRunner(sp, escAC.Name)
+			if servers, ts, _ := buildMCPToolSet(context.Background(), cfg, escAC.Name); ts != nil {
+				r = r.withMCPToolSet(servers, ts)
+			}
+			return r, nil
+		}
+	}
+
+	if !escAC.IsCLI() {
+		freshEscAC := applyFreshAWSCreds(cfg, escAC)
+		if freshEscAC.URL != "" {
+			la := local.NewFromConfig(freshEscAC).AsEscalationTarget(freshEscAC.Name)
+			if od, err := config.OtelDir(); err == nil {
+				la.WithOtelDir(od)
+			}
+			la.WithLogContext(cfg.Otel.LogContext)
+			la.WithOnTokens(func(model, role string, prompt, completion, cacheRead, cacheCreation int64) {
+				sess.AddTokensFull(model, role, prompt, completion, cacheRead, cacheCreation)
+			})
+			la = la.WithSkipPermissions(cliAgentConfig(cfg).DangerouslySkipPermissions)
+			if lp, err := local.OpenPermStore(cwd); err == nil {
+				la.WithPermissions(lp, nil)
+			}
+			if dbg, err := openLocalDebugLog(cfg); err != nil {
+				fmt.Fprintf(os.Stderr, "%s warning: cannot open local debug log: %v\n", milkTag(), err)
+			} else if dbg != nil {
+				la = la.WithDebugLog(dbg)
+			}
+			name := escAC.Name
+			if name == "" {
+				name = "escalation"
+			}
+			la, mcpErr := attachMCPToolSet(context.Background(), cfg, escAC.Name, la)
+			if mcpErr != nil {
+				fmt.Fprintf(os.Stderr, "%s warning: %v\n", milkTag(), mcpErr)
+			}
+			return newLocalRunner(la, name), nil
+		}
+		fmt.Fprintf(os.Stderr, "%s warning: escalation_agent %q not found in agents — falling back to claude-cli\n", milkTag(), cfg.EscalationAgent)
+	}
+
+	// Default: Claude CLI escalation agent.
+	cliAC := cliAgentConfig(cfg)
+	cliAgt := newCLIAgent(cliAC)
+	cliAgt = applyAWSCreds(cfg, cliAgt)
+	cliAgt = cliAgt.WithLogContext(cfg.Otel.LogContext)
+	if dbg, err := openCLIDebugLog(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "%s warning: cannot open claude debug log: %v\n", milkTag(), err)
+	} else if dbg != nil {
+		cliAgt = cliAgt.WithDebugLog(dbg)
+	}
+	var cs *claudesettings.Store
+	if store, err := claudesettings.Open(cwd); err == nil {
+		cs = store
+	}
+	name := cliAC.Name
+	if name == "" {
+		name = "claude"
+	}
+	r := newCLIRunner(cliAgt, name, permContext{cs: cs, cwd: cwd}, func() inputReader { return newStdinInputReader() })
+	if servers := cfg.EffectiveMCPServers(cliAC.Name); len(servers) > 0 {
+		r = r.withMCPServers(servers)
+	}
+	return r, nil
+}
+
+// cliAgentConfig returns the AgentConfig for the claude-cli backend: the
+// escalation agent whenever it is a claude-cli entry (an unset
+// escalation_agent resolves to "claude" — an entry of that name, or the
+// built-in one), otherwise the first entry with Provider "claude-cli", or a
+// built-in default.
+func cliAgentConfig(cfg config.Config) config.AgentConfig {
+	if esc := cfg.EscalationAgentConfig(); esc.IsCLI() {
+		return esc
+	}
+	for _, a := range cfg.Agents {
+		if a.IsCLI() {
+			return a
+		}
+	}
+	return config.AgentConfig{Name: "claude", Provider: "claude-cli", Bin: "claude"}
+}
+
+// cliBaselineTools are pre-approved on every claude-cli invocation regardless of
+// config so a fresh workspace never hits Claude Code's silent pre-flight block
+// before the interactive permission handler is active.
+var cliBaselineTools = []string{"Bash", "Read", "Write", "Edit"}
+
+// newCLIAgent constructs a claude.Agent from the claude-cli AgentConfig.
+func newCLIAgent(ac config.AgentConfig) *claude.Agent {
+	bin := ac.Bin
+	if bin == "" {
+		bin = "claude"
+	}
+	// Merge baseline into user-configured tools without duplicates.
+	tools := append([]string{}, cliBaselineTools...)
+	for _, t := range ac.AllowedTools {
+		if !slices.Contains(tools, t) {
+			tools = append(tools, t)
+		}
+	}
+	agent := claude.NewWithOpts(bin, ac.DangerouslySkipPermissions, tools, ac.AddDirs)
+	if len(ac.SettingsJSON) > 0 {
+		agent = agent.WithSettings(ac.SettingsJSON)
+	}
+	return agent
+}
+
+// attachMCPToolSet builds an mcp.ToolSet from the MCP servers configured for
+// agentName, connects all clients concurrently, and wires it into la via
+// WithMCPToolSet. Partial connectivity is preferred over a hard startup
+// failure: when some clients fail, the ToolSet is still wired so lazy
+// reconnect inside Schemas() / Dispatch() can retry on first use.
+// When no MCP servers are configured for the agent, la is returned unchanged.
+func attachMCPToolSet(ctx context.Context, cfg config.Config, agentName string, la *local.Agent) (*local.Agent, error) {
+	servers := cfg.EffectiveMCPServers(agentName)
+	if len(servers) == 0 {
+		return la, nil
+	}
+	clients := make([]*mcp.Client, 0, len(servers))
+	for _, s := range servers {
+		clients = append(clients, mcp.New(s))
+	}
+	ts := mcp.NewToolSet(clients)
+	connectCtx, connectCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer connectCancel()
+	var connectErr error
+	if err := ts.ConnectAll(connectCtx); err != nil {
+		connectErr = fmt.Errorf("MCP connect error for agent %q: %w", agentName, err)
+		obs.Info("mcp.attach.failed", "agent", agentName, "error", err.Error())
+	}
+	// Always wire the ToolSet even if no clients connected at startup.
+	// Lazy reconnect inside Schemas() / Dispatch() will retry on first use.
+	la = la.WithMCPToolSet(ts)
+	return la, connectErr
+}
+
+// buildMCPToolSet builds a connected mcp.ToolSet for agentName using the servers
+// from cfg, or returns (nil, nil) when no servers are configured. Errors are
+// logged as warnings; partial connectivity is acceptable — lazy reconnect retries on use.
+func buildMCPToolSet(ctx context.Context, cfg config.Config, agentName string) ([]config.MCPServerConfig, *mcp.ToolSet, error) {
+	servers := cfg.EffectiveMCPServers(agentName)
+	if len(servers) == 0 {
+		return nil, nil, nil
+	}
+	clients := make([]*mcp.Client, 0, len(servers))
+	for _, s := range servers {
+		clients = append(clients, mcp.New(s))
+	}
+	ts := mcp.NewToolSet(clients)
+	connectCtx, connectCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer connectCancel()
+	if err := ts.ConnectAll(connectCtx); err != nil {
+		obs.Info("mcp.attach.failed", "agent", agentName, "error", err.Error())
+		return servers, ts, fmt.Errorf("MCP connect error for agent %q: %w", agentName, err)
+	}
+	return servers, ts, nil
+}
+
+// activeLocalAgentConfig returns the active AgentConfig with AWSRefreshCmd
+// populated from ~/.claude/settings.json when aws_auth_refresh is enabled.
+// All NewFromConfig call sites should use this instead of cfg.ActiveAgent()
+// directly so the transport gets the refresh command wired in.
+func activeLocalAgentConfig(cfg config.Config) config.AgentConfig {
+	ac := cfg.ActiveAgent()
+	if cfg.AWSAuthRefresh && strings.ToLower(strings.TrimSpace(ac.Provider)) == "bedrock" {
+		ac.AWSRefreshCmd = claudesettings.AWSAuthRefreshCommand()
+	}
+	return ac
+}
+
+// needsAWSRefresh reports whether an async background credential refresh is
+// required for the active local agent.
+func needsAWSRefresh(cfg config.Config) bool {
+	if !cfg.AWSAuthRefresh {
+		return false
+	}
+	ac := cfg.ActiveAgent()
+	if strings.ToLower(strings.TrimSpace(ac.Provider)) != "bedrock" {
+		return false
+	}
+	return ac.AWSKeyID == "" // explicit config takes precedence
+}
+
+// needsTokenCmdRefresh reports whether the active local agent uses token_cmd
+// and should show a status bar hint while the first token is fetched.
+func needsTokenCmdRefresh(cfg config.Config) bool {
+	ac := cfg.ActiveAgent()
+	return ac.TokenCmd != "" && strings.ToLower(strings.TrimSpace(ac.Provider)) != "bedrock"
+}
+
+// applyFreshAWSCreds refreshes AWS credentials in ac when aws_auth_refresh is
+// enabled and the provider is "bedrock" without explicit credentials already set.
+func applyFreshAWSCreds(cfg config.Config, ac config.AgentConfig) config.AgentConfig {
+	if !cfg.AWSAuthRefresh {
+		return ac
+	}
+	if strings.ToLower(strings.TrimSpace(ac.Provider)) != "bedrock" {
+		return ac
+	}
+	if ac.AWSKeyID != "" {
+		return ac // explicit config takes precedence; don't override
+	}
+	cmd := claudesettings.AWSAuthRefreshCommand()
+	if cmd == "" {
+		return ac
+	}
+	creds, err := claude.ResolveAWSCreds(cmd)
+	if err != nil || creds == nil {
+		fmt.Fprintf(os.Stderr, "%s warning: aws_auth_refresh for local bedrock agent failed: %v\n", milkTag(), err)
+		return ac
+	}
+	ac.AWSKeyID = creds.AccessKeyID
+	ac.AWSSecret = creds.SecretAccessKey
+	ac.AWSToken = creds.SessionToken
+	return ac
+}
+
+// applyAWSCreds injects resolved AWS credentials into the agent when
+// cfg.AWSAuthRefresh is enabled. The command is read from ~/.claude/settings.json.
+func applyAWSCreds(cfg config.Config, agent *claude.Agent) *claude.Agent {
+	if !cfg.AWSAuthRefresh {
+		return agent
+	}
+	cmd := claudesettings.AWSAuthRefreshCommand()
+	if cmd == "" {
+		fmt.Fprintf(os.Stderr, "%s warning: aws_auth_refresh enabled but awsAuthRefresh not found in ~/.claude/settings.json\n", milkTag())
+		return agent
+	}
+	creds, err := claude.ResolveAWSCreds(cmd)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s warning: aws_auth_refresh failed: %v\n", milkTag(), err)
+		return agent
+	}
+	if creds != nil {
+		agent = agent.WithExtraEnv(creds.Env()...)
+	}
+	return agent
+}
+
+// openCLIDebugLog opens (or creates/appends) the Claude raw NDJSON debug log
+// when cfg.DebugCLILog is true. Returns nil, nil when disabled.
+// The caller is responsible for closing the returned writer.
+func openCLIDebugLog(cfg config.Config) (*obs.RotatingWriter, error) {
+	if !cfg.DebugCLILog {
+		return nil, nil
+	}
+	path, err := config.CLIDebugLogPath()
+	if err != nil {
+		return nil, err
+	}
+	maxBytes := cfg.Otel.DebugLogMaxBytes
+	if maxBytes <= 0 {
+		maxBytes = 104857600
+	}
+	maxFiles := cfg.Otel.DebugLogMaxFiles
+	if maxFiles <= 0 {
+		maxFiles = 5
+	}
+	return obs.NewRotatingWriter(path, maxBytes, maxFiles)
+}
+
+func openLocalDebugLog(cfg config.Config) (*obs.RotatingWriter, error) {
+	if !cfg.DebugLocalLog {
+		return nil, nil
+	}
+	path, err := config.LocalDebugLogPath()
+	if err != nil {
+		return nil, err
+	}
+	maxBytes := cfg.Otel.DebugLogMaxBytes
+	if maxBytes <= 0 {
+		maxBytes = 104857600
+	}
+	maxFiles := cfg.Otel.DebugLogMaxFiles
+	if maxFiles <= 0 {
+		maxFiles = 5
+	}
+	return obs.NewRotatingWriter(path, maxBytes, maxFiles)
+}
+
+func openSubprocessDebugLog(cfg config.Config) (*obs.RotatingWriter, error) {
+	if !cfg.DebugSubprocessLog {
+		return nil, nil
+	}
+	path, err := config.SubprocessDebugLogPath()
+	if err != nil {
+		return nil, err
+	}
+	maxBytes := cfg.Otel.DebugLogMaxBytes
+	if maxBytes <= 0 {
+		maxBytes = 104857600
+	}
+	maxFiles := cfg.Otel.DebugLogMaxFiles
+	if maxFiles <= 0 {
+		maxFiles = 5
+	}
+	return obs.NewRotatingWriter(path, maxBytes, maxFiles)
+}
+
+func memoryDir() (string, error) {
+	dir, err := config.Dir()
+	if err != nil {
+		return "", fmt.Errorf("memory dir: %w", err)
+	}
+	return dir + "/memory", nil
+}
+
+// initObs bootstraps OTel, prints any file-size warning, and returns a
+// shutdown function. It never returns an error — OTel failures are non-fatal.
+func initObs(cfg config.Config) (shutdown func(context.Context) error) {
+	otelDir, err := config.OtelDir()
+	if err != nil {
+		return func(context.Context) error { return nil }
+	}
+
+	if warn, exceeded := obs.CheckFileSizes(cfg.Otel, otelDir); exceeded {
+		fmt.Fprintln(os.Stderr, milkTag()+" "+warn)
+		// Hard cap exceeded — skip OTel for this session.
+		return func(context.Context) error { return nil }
+	} else if warn != "" {
+		fmt.Fprintln(os.Stderr, milkTag()+" warning: "+warn)
+	}
+
+	shutdown, err = obs.Init(cfg.Otel, otelDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s warning: OTel init failed: %v\n", milkTag(), err)
+		return func(context.Context) error { return nil }
+	}
+	// internal/loop can't import internal/obs directly (import cycle via
+	// internal/config), so hand it the same log sink explicitly — otherwise
+	// its diagnostics fall back to slog.Default() and bleed raw log lines
+	// into the TUI's alt-screen.
+	loop.SetLogger(obs.Logger())
+	return shutdown
+}
+
+func loadSessionForRun(cwd string) (*session.Session, error) {
+	if flagNew {
+		return session.New(cwd, flagSession)
+	}
+	return session.Resume(cwd, flagSession)
+}
+
+func checkAgentAvailability(ctx context.Context, localAgent *local.Agent, cliAgent *claude.Agent) (bool, bool, error) {
+	localAvail := localAgent.Ping(ctx) == nil
+	escalationAvail := cliAgent.Ping() == nil
+
+	if !localAvail {
+		fmt.Fprintln(os.Stderr, milkTag()+" warning: primary agent unreachable — routing all to escalation agent")
+	}
+	if !escalationAvail {
+		fmt.Fprintln(os.Stderr, milkTag()+" warning: escalation agent unavailable — primary only")
+	}
+
+	return localAvail, escalationAvail, nil
+}
+
+func resolveTarget(target router.Target, localAvail, escalationAvail bool) router.Target {
+	if target == router.TargetLocal && !localAvail {
+		return router.TargetEscalation
+	}
+	if target == router.TargetEscalation && !escalationAvail {
+		return router.TargetLocal
+	}
+	return target
+}
+
+// turnSourceLabel returns the "source" label for milk.turns.total based on
+// which flag or routing mode triggered the turn.
+func turnSourceLabel(explicitEscalate, explicitPrimary bool) string {
+	if explicitEscalate || explicitPrimary {
+		return "user"
+	}
+	return "auto"
+}
+
+// logStateTransition emits a debug log entry and metric for a session state change.
+func logStateTransition(sess *session.Session, next session.State, trigger string) {
+	obs.Debug("state transition", "from", string(sess.State), "to", string(next), "trigger", trigger)
+	obs.Inc(context.Background(), milkScope, "milk.session.state_transitions",
+		attribute.String("from", string(sess.State)),
+		attribute.String("to", string(next)),
+	)
+}
+
+const cliLabel = "claude:"
+
+func cliLabelStyled(a *claude.Agent) string {
+	if a.SkipPermissions() {
+		return bold(red(cliLabel))
+	}
+	return bold(blue(cliLabel))
+}
+
+// inputReader abstracts user input for permission prompts.
+// In single-shot mode it reads os.Stdin directly.
+type inputReader interface {
+	readLine(prompt string) (string, error)
+}
+
+// stdinInputReader reads from os.Stdin using a bufio.Scanner (line-buffered).
+type stdinInputReader struct {
+	s *bufio.Scanner
+}
+
+func newStdinInputReader() *stdinInputReader {
+	return &stdinInputReader{s: bufio.NewScanner(os.Stdin)}
+}
+
+func (r *stdinInputReader) readLine(prompt string) (string, error) {
+	fmt.Fprint(os.Stdout, prompt)
+	if r.s.Scan() {
+		return strings.TrimSpace(r.s.Text()), nil
+	}
+	return "", io.EOF
+}
+
+// buildAgentHistory converts sess.History[start:] to the local agent's Message
+// format. Each turn is prefixed with a speaker label so the receiving agent can
+// attribute prior turns correctly:
+//   - user turns          → "[user to <agent>] …"
+//   - own assistant turns → unlabeled (model already knows what it said)
+//   - other agent's turns → "[<name> as <role>] …"
+//
+// selfAgent and selfName identify the agent that will receive this history.
+// Pass start=0 for full history, or session.LastEscalationBoundary(sess) to
+// scope to turns since the last escalation boundary.
+//
+// When skipOtherAgents is true, contiguous turns by/for other agents are
+// collapsed into a single aggregated placeholder (e.g. "[escalation]: (24 turns
+// omitted)"). Only the current agent's own turns and user turns targeted at it
+// are included verbatim.
+func buildAgentHistory(sess *session.Session, start int, selfAgent session.Agent, selfName string, skipOtherAgents bool) []local.Message {
+	if !skipOtherAgents {
+		return buildAgentHistoryFull(sess.History[start:], selfAgent)
+	}
+
+	// Lazy mode: walk through turns, emitting own turns immediately and
+	// collapsing contiguous blocks of other-agent turns into placeholders.
+	var msgs []local.Message
+	var skipped int                   // count of contiguous omitted turns
+	var skippedAgents map[string]bool // agent names seen in the current skip block
+	for _, t := range sess.History[start:] {
+		own := turnIsForAgent(t, selfAgent)
+		if own {
+			// Flush any pending skip block before emitting an own turn.
+			if skipped > 0 {
+				msgs = append(msgs, makePlaceholder(skipped, skippedAgents))
+				skipped = 0
+				skippedAgents = nil
+			}
+			// Skip empty assistant turns — inference servers reject them.
+			if t.Role == session.RoleAssistant && t.Content == "" {
+				continue
+			}
+			msgs = append(msgs, formatOwnTurn(t, selfAgent))
+		} else {
+			skipped++
+			if skippedAgents == nil {
+				skippedAgents = make(map[string]bool)
+			}
+			skippedAgents[string(t.Agent)] = true
+		}
+	}
+	// Flush trailing skip block.
+	if skipped > 0 {
+		msgs = append(msgs, makePlaceholder(skipped, skippedAgents))
+	}
+	return msgs
+}
+
+// buildAgentHistoryFull includes all turns with labels (non-lazy mode).
+func buildAgentHistoryFull(turns []session.Turn, selfAgent session.Agent) []local.Message {
+	var msgs []local.Message
+	for _, t := range turns {
+		switch t.Role {
+		case session.RoleUser:
+			agentName := t.AgentName
+			if agentName == "" {
+				agentName = string(t.Agent)
+			}
+			msgs = append(msgs, local.Message{Role: "user", Speaker: "user", Content: "[user to " + agentName + "] " + t.Content})
+		case session.RoleAssistant:
+			if t.Content == "" {
+				continue
+			}
+			speaker := string(t.Agent)
+			if t.Agent == selfAgent {
+				msgs = append(msgs, local.Message{Role: "assistant", Speaker: speaker, Content: t.Content})
+			} else {
+				name := t.AgentName
+				if name == "" {
+					name = speaker
+				}
+				msgs = append(msgs, local.Message{Role: "system", Speaker: speaker, Content: "[" + name + " as " + speaker + "] " + t.Content})
+			}
+		case session.RoleToolResult:
+			if t.Agent == selfAgent {
+				msgs = append(msgs, local.Message{Role: "tool", Speaker: string(t.Agent), Content: t.Content})
+			}
+		}
+	}
+	return msgs
+}
+
+// turnIsForAgent reports whether a turn belongs to (was made by or directed at) the given agent.
+func turnIsForAgent(t session.Turn, agent session.Agent) bool {
+	if t.Role == session.RoleUser {
+		return t.Agent == agent
+	}
+	return t.Agent == agent
+}
+
+// formatOwnTurn formats a turn that belongs to the current agent.
+func formatOwnTurn(t session.Turn, selfAgent session.Agent) local.Message {
+	switch t.Role {
+	case session.RoleUser:
+		agentName := t.AgentName
+		if agentName == "" {
+			agentName = string(t.Agent)
+		}
+		return local.Message{Role: "user", Speaker: "user", Content: "[user to " + agentName + "] " + t.Content}
+	case session.RoleAssistant:
+		return local.Message{Role: "assistant", Speaker: string(t.Agent), Content: t.Content}
+	case session.RoleToolResult:
+		return local.Message{Role: "tool", Speaker: string(t.Agent), Content: t.Content}
+	default:
+		return local.Message{Role: "system", Content: t.Content}
+	}
+}
+
+// makePlaceholder builds an aggregated placeholder for a block of omitted turns.
+func makePlaceholder(count int, agents map[string]bool) local.Message {
+	var names []string
+	for name := range agents {
+		names = append(names, name)
+	}
+	// Stable order for determinism.
+	sort.Strings(names)
+	who := strings.Join(names, " and ")
+	return local.Message{Role: "system", Content: "[" + who + "]: (" + pluralize(count, "turn") + " omitted)"}
+}
+
+func pluralize(n int, word string) string {
+	if n == 1 {
+		return "1 " + word
+	}
+	return fmt.Sprintf("%d %ss", n, word)
+}
+
+// escalationLocalHistory returns the full session history for a local escalation agent.
+func escalationLocalHistory(sess *session.Session, selfName string, skipOtherAgents bool) []local.Message {
+	return buildAgentHistory(sess, 0, session.AgentEscalation, selfName, skipOtherAgents)
+}
+
+// escalationLocalHistoryFresh returns only turns since the last escalation
+// boundary, scoped to avoid sending redundant prior-escalation context.
+func escalationLocalHistoryFresh(sess *session.Session, selfName string, skipOtherAgents bool) []local.Message {
+	return buildAgentHistory(sess, session.LastEscalationBoundary(sess), session.AgentEscalation, selfName, skipOtherAgents)
+}
+
+// applyPersistedGrants loads previously-approved tools and directories from
+// settings.json and wires them into the agent so grants survive across turns.
+// In single-shot mode it also installs the interactive permission handler.
+func applyPersistedGrants(agent *claude.Agent, pc permContext) *claude.Agent {
+	// Always trust the working directory and /tmp so Claude's directory-trust check
+	// never fires as a silent "Stream closed" error before the permission handler is active.
+	// /tmp is a universal scratch space — pre-flight blocks on it are always spurious.
+	if pc.cwd != "" {
+		agent = agent.WithExtraDir(pc.cwd)
+	}
+	agent = agent.WithExtraDir("/tmp")
+	if pc.cs == nil {
+		return agent
+	}
+	if tools, err := pc.cs.AllowedTools(); err == nil {
+		for _, t := range tools {
+			agent = agent.WithExtraAllowedTool(t)
+		}
+	}
+	if dirs, err := pc.cs.AllowedDirectories(); err == nil {
+		for _, d := range dirs {
+			agent = agent.WithExtraDir(d)
+		}
+	}
+	return agent
+}
+
+// shouldInjectMemoryInstructions returns true when the memory/need instruction
+// block must be included in this escalation turn's system-prompt context.
+// Always injects on first escalation (not resuming). On subsequent resume turns
+// skips injection unless the turn-count or byte-volume threshold has been crossed
+// since the last injection.
+func shouldInjectMemoryInstructions(cfg config.Config, sess *session.Session, resuming bool) bool {
+	if !resuming {
+		return true
+	}
+	escAC := cfg.EscalationAgentConfig()
+	turnThreshold := cfg.AgentMemoryReinjectionTurnThreshold(escAC, false)
+	byteThreshold := cfg.AgentMemoryReinjectionByteThreshold(escAC, false)
+	if turnThreshold == 0 && byteThreshold == 0 {
+		return false
+	}
+	turnsSince := sess.EscalationTurnCount() - sess.MemoryInstructionInjectedAt
+	if turnThreshold > 0 && turnsSince >= turnThreshold {
+		return true
+	}
+	bytesSince := sess.EscalationOutputBytesSince(sess.MemoryInstructionInjectedAt)
+	if byteThreshold > 0 && bytesSince >= byteThreshold {
+		return true
+	}
+	return false
+}
+
+// handlePermissionDenials checks the result for permission issues and retries if the user approves.
+func handlePermissionDenials(ctx context.Context, sess *session.Session, agent *claude.Agent, res claude.ParseResult, input inputReader, out io.Writer, pc permContext, nonce string, primaryName, escalationName string) claude.ParseResult {
+	if len(res.PermissionDenials) > 0 {
+		return handleStructuredDenials(ctx, sess, agent, res, input, out, pc, nonce, primaryName, escalationName)
+	}
+	return res
+}
+
+// permContext bundles the mutable permission state threaded through a CLI escalation turn.
+type permContext struct {
+	cs          *claudesettings.Store
+	cwd         string                 // working directory; always passed as --add-dir so trust checks don't silently fail
+	toolFutures map[string]chan string // tool name → buffered channel pre-filled by OnToolUse
+	// contextHash, when non-nil, holds the hash of the last per-turn context block
+	// prepended to a resumed escalation prompt (cliRunner.Execute). An identical
+	// block on the next resume is dropped instead of being appended again.
+	contextHash *string
+}
+
+// handleStructuredDenials handles permission_denials from the result event —
+// language-neutral, fires regardless of the escalation agent's response language.
+func handleStructuredDenials(ctx context.Context, sess *session.Session, agent *claude.Agent, res claude.ParseResult, input inputReader, out io.Writer, pc permContext, nonce string, primaryName, escalationName string) claude.ParseResult {
+	denials := dedupDenials(res.PermissionDenials)
+
+	// Partition AskUserQuestion denials from regular tool-permission denials.
+	var askDenials, regularDenials []claude.PermissionDenialRecord
+	for _, d := range denials {
+		if d.ToolName == "AskUserQuestion" {
+			askDenials = append(askDenials, d)
+		} else {
+			regularDenials = append(regularDenials, d)
+		}
+	}
+
+	// For AskUserQuestion, collect answers and resume with them injected as text.
+	if len(askDenials) > 0 {
+		resumePrompt := buildAskUserQuestionAnswers(askDenials, input, out)
+		fmt.Fprint(out, cliLabelStyled(agent)+" ")
+		retried, err := agent.RunResume(ctx, sess.EscalationSessionID, escalation.MemoryInstruction(nonce, primaryName, escalationName), "", resumePrompt, out)
+		if err != nil {
+			return res
+		}
+		// If there were also regular denials, handle them on the retried result.
+		if len(regularDenials) > 0 && len(retried.PermissionDenials) > 0 {
+			return handleStructuredDenials(ctx, sess, agent, retried, input, out, pc, nonce, primaryName, escalationName)
+		}
+		return retried
+	}
+
+	fmt.Fprintf(out, "\n%s escalation agent was blocked from using:\n", milkTag())
+	retryAgent, changed := applyDenials(agent, regularDenials, input, out, pc)
+	if !changed {
+		return res
+	}
+	fmt.Fprint(out, cliLabelStyled(retryAgent)+" ")
+	retried, err := retryAgent.RunResume(ctx, sess.EscalationSessionID, escalation.MemoryInstruction(nonce, primaryName, escalationName), "", "Please continue with the approved permissions.", out)
+	if err != nil {
+		return res
+	}
+	return retried
+}
+
+// handleStreamClosedDenials handles the pre-flight "Stream closed" class of failures:
+// Claude's directory-trust check fires before --permission-prompt-tool stdio is active,
+// so no control_request event is ever emitted. Instead we detect the error in the
+// type:"user" tool_result NDJSON line and offer an interactive prompt here, post-turn.
+func handleStreamClosedDenials(ctx context.Context, sess *session.Session, agent *claude.Agent, res claude.ParseResult, input inputReader, out io.Writer, pc permContext, nonce string, primaryName, escalationName string) claude.ParseResult {
+	if len(res.StreamClosedDenials) == 0 {
+		return res
+	}
+	fmt.Fprintf(out, "\n%s escalation agent hit a directory-trust error on:\n", milkTag())
+	retryAgent := agent
+	changed := false
+	for _, d := range res.StreamClosedDenials {
+		label := d.Name
+		if label == "" {
+			label = d.ToolUseID
+		}
+		fmt.Fprintf(out, "  • %s", bold(label))
+		suggested := suggestDir(d.Input)
+		if cmd, ok := d.Input["command"].(string); ok {
+			fmt.Fprintf(out, " → %s", dim(cmd))
+		} else if path, ok := d.Input["file_path"].(string); ok {
+			fmt.Fprintf(out, " → %s", dim(path))
+		}
+		fmt.Fprintln(out)
+		// Offer tool grant.
+		yn := drainFuture(pc.toolFutures, d.Name)
+		if yn == "" {
+			yn, _ = input.readLine(fmt.Sprintf("    allow tool %s? [Y/n] ", bold(d.Name)))
+			if yn == "" {
+				yn = "y"
+			}
+		} else {
+			fmt.Fprintf(out, "    allow tool %s? [Y/n] %s\n", bold(d.Name), yn)
+		}
+		if strings.EqualFold(yn, "y") {
+			retryAgent = retryAgent.WithExtraAllowedTool(d.Name)
+			if pc.cs != nil {
+				pc.cs.AllowTool(d.Name) //nolint:errcheck
+			}
+			changed = true
+		}
+		// Offer directory grant.
+		dir := askDir(input, suggested)
+		if dir != "" {
+			retryAgent = retryAgent.WithExtraDir(dir)
+			if pc.cs != nil {
+				pc.cs.AllowDirectory(dir) //nolint:errcheck
+			}
+			changed = true
+		}
+	}
+	if !changed {
+		return res
+	}
+	fmt.Fprint(out, cliLabelStyled(retryAgent)+" ")
+	retried, err := retryAgent.RunResume(ctx, sess.EscalationSessionID, escalation.MemoryInstruction(nonce, primaryName, escalationName), "", "Continue — if the previous tool invocations that errored with permission issues haven't been retried with alternatives, please retry them now with the newly granted permissions.", out)
+	if err != nil {
+		return res
+	}
+	return retried
+}
+
+// buildAskUserQuestionAnswers presents each AskUserQuestion denial to the user,
+// collects their selections, and returns a prompt string that tells Claude the answers.
+// input.readLine handles display: in single-shot mode it prints to stdout; in TUI mode
+// it sends a permRequestMsg that the TUI renders in the transcript.
+func buildAskUserQuestionAnswers(denials []claude.PermissionDenialRecord, input inputReader, _ io.Writer) string {
+	var answers []string
+	for _, d := range denials {
+		questions := claude.ParseAskUserQuestionInput(d.ToolInput)
+		for _, q := range questions {
+			var promptBuf strings.Builder
+			fmt.Fprintf(&promptBuf, "\n%s %s\n", milkTag(), bold(q.Question))
+			for i, opt := range q.Options {
+				if opt.Description != "" {
+					fmt.Fprintf(&promptBuf, "  %d. %s — %s\n", i+1, bold(opt.Label), opt.Description)
+				} else {
+					fmt.Fprintf(&promptBuf, "  %d. %s\n", i+1, bold(opt.Label))
+				}
+			}
+			fmt.Fprintf(&promptBuf, "%s Select [1-%d]: ", milkTag(), len(q.Options))
+
+			type labeledReader interface {
+				readLineLabeled(prompt, label string) (string, error)
+			}
+			var line string
+			if lr, ok := input.(labeledReader); ok {
+				line, _ = lr.readLineLabeled(promptBuf.String(), "[select]")
+			} else {
+				line, _ = input.readLine(promptBuf.String())
+			}
+			line = strings.TrimSpace(line)
+			chosen := ""
+			for i, opt := range q.Options {
+				if line == fmt.Sprintf("%d", i+1) || strings.EqualFold(line, opt.Label) {
+					chosen = opt.Label
+					break
+				}
+			}
+			if chosen == "" {
+				chosen = line // pass free-text through verbatim
+			}
+			if chosen != "" {
+				answers = append(answers, fmt.Sprintf("%s: %s", q.Question, chosen))
+			}
+		}
+	}
+	if len(answers) == 0 {
+		return "Please continue."
+	}
+	return "My answers to your questions:\n" + strings.Join(answers, "\n")
+}
+
+func dedupDenials(src []claude.PermissionDenialRecord) []claude.PermissionDenialRecord {
+	seen := map[string]bool{}
+	var out []claude.PermissionDenialRecord
+	for _, d := range src {
+		if !seen[d.ToolName] {
+			seen[d.ToolName] = true
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+func applyDenials(agent *claude.Agent, denials []claude.PermissionDenialRecord, input inputReader, out io.Writer, pc permContext) (*claude.Agent, bool) {
+	changed := false
+	for _, d := range denials {
+		printDenialHeader(d, out)
+		if applyToolGrant(d, input, out, pc, &agent) {
+			changed = true
+		}
+		if applyDirGrant(d, input, pc, &agent) {
+			changed = true
+		}
+	}
+	return agent, changed
+}
+
+func printDenialHeader(d claude.PermissionDenialRecord, out io.Writer) {
+	fmt.Fprintf(out, "  • %s", bold(d.ToolName))
+	if cmd, ok := d.ToolInput["command"].(string); ok {
+		fmt.Fprintf(out, " → %s", dim(cmd))
+	} else if path, ok := d.ToolInput["file_path"].(string); ok {
+		fmt.Fprintf(out, " → %s", dim(path))
+	}
+	fmt.Fprintln(out)
+}
+
+func applyToolGrant(d claude.PermissionDenialRecord, input inputReader, out io.Writer, pc permContext, agent **claude.Agent) bool {
+	yn := drainFuture(pc.toolFutures, d.ToolName)
+	if yn == "" {
+		yn, _ = input.readLine(fmt.Sprintf("    allow tool %s? [Y/n] ", bold(d.ToolName)))
+		if yn == "" {
+			yn = "y"
+		}
+	} else {
+		fmt.Fprintf(out, "    allow tool %s? [Y/n] %s\n", bold(d.ToolName), yn)
+	}
+	if !strings.EqualFold(yn, "y") {
+		return false
+	}
+	*agent = (*agent).WithExtraAllowedTool(d.ToolName)
+	if pc.cs != nil {
+		pc.cs.AllowTool(d.ToolName) //nolint:errcheck
+	}
+	return true
+}
+
+func applyDirGrant(d claude.PermissionDenialRecord, input inputReader, pc permContext, agent **claude.Agent) bool {
+	dir := askDir(input, suggestDir(d.ToolInput))
+	if dir == "" {
+		return false
+	}
+	*agent = (*agent).WithExtraDir(dir)
+	if pc.cs != nil {
+		pc.cs.AllowDirectory(dir) //nolint:errcheck
+	}
+	return true
+}
+
+// suggestDir extracts a suggested directory from a tool input map.
+// Checks common path keys ("path", "file_path"), then scans "command" for the
+// first absolute path token.
+func suggestDir(input map[string]any) string {
+	for _, key := range []string{"path", "file_path", "filepath"} {
+		if path, ok := input[key].(string); ok && path != "" {
+			return filepath.Dir(path)
+		}
+	}
+	if cmd, ok := input["command"].(string); ok {
+		for token := range strings.FieldsSeq(cmd) {
+			if filepath.IsAbs(token) {
+				return filepath.Dir(token)
+			}
+		}
+	}
+	return ""
+}
+
+// askDir proposes a directory and asks Y/n (enter = yes).
+// Falls back to cwd when suggested is empty. Returns "" only if the user types "n".
+func askDir(input inputReader, suggested string) string {
+	if suggested == "" {
+		suggested, _ = os.Getwd()
+	}
+	if suggested == "" {
+		return ""
+	}
+	yn, _ := input.readLine(fmt.Sprintf("    allow directory %s? [Y/n] ", bold(suggested)))
+	if strings.EqualFold(yn, "n") {
+		return ""
+	}
+	return suggested
+}
+
+// drainFuture reads from the pre-seeded channel for toolName (if any).
+// Returns "" when no future exists. Blocks only if the channel was created but
+// the user hasn't answered yet (should resolve in milliseconds after stream ends).
+func drainFuture(futures map[string]chan string, toolName string) string {
+	if futures == nil {
+		return ""
+	}
+	ch, ok := futures[toolName]
+	if !ok {
+		return ""
+	}
+	yn := <-ch
+	if yn == "" {
+		yn = "y"
+	}
+	return yn
+}
+
+// makePermissionHandler returns a PermissionHandler for single-shot (non-TUI)
+// mode. It asks y/n interactively and, on approval, persists the grant to the
+// project settings so the tool is auto-allowed on future runs.
+// cs may be nil — persistence is best-effort.
+func makePermissionHandler(input inputReader, out io.Writer, cs *claudesettings.Store) claude.PermissionHandler {
+	return func(req claude.ControlRequest, stdinW io.Writer) {
+		fmt.Fprintln(out)
+		printPermissionRequest(req, out)
+		yn, _ := input.readLine(fmt.Sprintf("%s Allow tool? [y/n] ", milkTag()))
+		if strings.EqualFold(yn, "y") {
+			claude.Allow(req.RequestID, stdinW)
+			if cs != nil && req.Body.ToolName != "" {
+				cs.AllowTool(req.Body.ToolName) //nolint:errcheck
+			}
+			if req.Body.BlockedPath != "" {
+				dir := filepath.Dir(req.Body.BlockedPath)
+				yn2, _ := input.readLine(fmt.Sprintf("    allow directory %s? [y/n] ", bold(dir)))
+				if strings.EqualFold(yn2, "y") && cs != nil {
+					cs.AllowDirectory(dir) //nolint:errcheck
+				}
+			}
+		} else {
+			claude.Deny(req.RequestID, stdinW)
+		}
+	}
+}
+
+// dimWrap wraps s in ANSI dim, closing and reopening the dim escape at each
+// embedded newline so every output line is a self-contained dim span and the
+// dim state never bleeds into subsequent lines rendered by the viewport.
+func dimWrap(s string) string {
+	const on, off = "\033[2m", "\033[0m"
+	if !strings.Contains(s, "\n") {
+		return on + s + off
+	}
+	lines := strings.Split(s, "\n")
+	for i, l := range lines {
+		lines[i] = on + l + off
+	}
+	return strings.Join(lines, "\n")
+}
+
+// cliToolArgSummary picks the most informative single argument value for display,
+// mirroring the local agent's toolArgSummary. Returns the full value — truncation
+// is done at the call site using terminal width.
+func cliToolArgSummary(args map[string]any) string {
+	for _, key := range []string{"command", "path", "file_path", "url", "query", "pattern", "reason", "content"} {
+		if v, ok := args[key].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// truncateToolSummary truncates a tool summary string to fit within termWidth,
+// accounting for the prefix "⚙ <name>: ". Pass termWidth=0 to skip truncation.
+func truncateToolSummary(name, summary string, termWidth int) string {
+	if termWidth <= 0 || summary == "" {
+		return summary
+	}
+	prefix := "⚙ " + name + ": "
+	maxSummary := termWidth - len(prefix) - 4 // 4 = margin
+	if maxSummary < 10 {
+		maxSummary = 10
+	}
+	runes := []rune(summary)
+	if len(runes) > maxSummary {
+		return string(runes[:maxSummary-1]) + "…"
+	}
+	return summary
+}
+
+// cliToolDiff returns a colored inline diff for Claude CLI file-edit tool calls.
+// Handles the Edit tool (old_string/new_string) and Write tool (content).
+func cliToolDiff(name string, input map[string]any) string {
+	switch name {
+	case "Edit":
+		path, _ := input["file_path"].(string)
+		oldStr, _ := input["old_string"].(string)
+		newStr, _ := input["new_string"].(string)
+		if path == "" || oldStr == "" {
+			return ""
+		}
+		return diff.ForEdit(path, oldStr, newStr, 3)
+	case "Write":
+		path, _ := input["file_path"].(string)
+		content, _ := input["content"].(string)
+		if path == "" {
+			return ""
+		}
+		return diff.ForWrite(path, content, 3)
+	}
+	return ""
+}
+
+// makeTUIPermissionHandler returns a PermissionHandler for TUI mode.
+// It races the TUI ask against the remote notifier: whichever responds first
+// (TUI y/n or remote allow/deny) wins. cs may be nil — persistence is best-effort.
+// notifier may be nil — treated as Noop.
+func makeTUIPermissionHandler(input inputReader, cs *claudesettings.Store, notifier oversight.Notifier) claude.PermissionHandler {
+	if notifier == nil {
+		notifier = oversight.Noop{}
+	}
+	return func(req claude.ControlRequest, stdinW io.Writer) {
+		b := req.Body
+		prompt := fmt.Sprintf("\n%s permission request — tool: %s", milkTag(), bold(b.ToolName))
+		if b.BlockedPath != "" {
+			prompt += fmt.Sprintf("  path: %s", dim(b.BlockedPath))
+		}
+		if b.DecisionReasonType != "" {
+			prompt += fmt.Sprintf("  reason: %s", b.DecisionReasonType)
+		}
+		prompt += "\n"
+		if summary := cliToolArgSummary(b.Input); summary != "" {
+			prompt += fmt.Sprintf("  %s\n", dim(summary))
+		}
+		if b.Description != "" {
+			prompt += fmt.Sprintf("  %s\n", b.Description)
+		}
+		prompt += fmt.Sprintf("%s Allow? [Y/n] ", milkTag())
+
+		// Race TUI input against remote notifier. Cancel the losing goroutine as
+		// soon as the first result arrives so neither leaks.
+		type result struct{ allow bool }
+		ch := make(chan result, 2)
+		raceCtx, cancelRace := context.WithCancel(context.Background())
+		defer cancelRace()
+
+		go func() {
+			// readLine blocks on a channel internally; we must also watch raceCtx
+			// so this goroutine exits when the Telegram side wins.
+			type lineResult struct {
+				yn  string
+				err error
+			}
+			lineCh := make(chan lineResult, 1)
+			go func() {
+				yn, err := input.readLine(prompt)
+				lineCh <- lineResult{yn: yn, err: err}
+			}()
+			select {
+			case lr := <-lineCh:
+				yn := lr.yn
+				if yn == "" {
+					yn = "y"
+				}
+				ch <- result{allow: strings.EqualFold(yn, "y")}
+			case <-raceCtx.Done():
+			}
+		}()
+
+		go func() {
+			dec := notifier.AskPermission(raceCtx, oversight.PermRequest{
+				ToolName:    b.ToolName,
+				Input:       cliToolArgSummary(b.Input),
+				Description: b.Description,
+				BlockedPath: b.BlockedPath,
+			})
+			select {
+			case ch <- result{allow: dec == oversight.PermAllow}:
+			case <-raceCtx.Done():
+			}
+		}()
+
+		res := <-ch
+		cancelRace()
+		if res.allow {
+			claude.Allow(req.RequestID, stdinW)
+			if cs != nil {
+				if b.ToolName != "" {
+					cs.AllowTool(b.ToolName) //nolint:errcheck
+				}
+				if b.BlockedPath != "" {
+					cs.AllowDirectory(filepath.Dir(b.BlockedPath)) //nolint:errcheck
+				}
+			}
+		} else {
+			claude.Deny(req.RequestID, stdinW)
+		}
+	}
+}
+
+// printPermissionRequest shows the user what the escalation agent is asking permission for.
+func printPermissionRequest(req claude.ControlRequest, out io.Writer) {
+	b := req.Body
+	fmt.Fprintf(out, "%s permission request — tool: %s", milkTag(), bold(b.ToolName))
+	if b.BlockedPath != "" {
+		fmt.Fprintf(out, "  path: %s", dim(b.BlockedPath))
+	}
+	if b.DecisionReasonType != "" {
+		fmt.Fprintf(out, "  reason: %s", b.DecisionReasonType)
+	}
+	fmt.Fprintln(out)
+	if summary := cliToolArgSummary(b.Input); summary != "" {
+		fmt.Fprintf(out, "  %s\n", dim(summary))
+	}
+	if b.Description != "" {
+		fmt.Fprintf(out, "  %s\n", b.Description)
+	}
+}
+
+// messagesCharCount returns the total character count across all message contents.
+func messagesCharCount(msgs []local.Message) int {
+	n := 0
+	for _, m := range msgs {
+		n += len(m.Content)
+	}
+	return n
+}
+
+// trimSplitIndex returns the index at which msgs should be split so that the
+// tail (msgs[idx:]) fits within budgetChars: drop the oldest user+assistant
+// pairs first, and any tool-result messages that follow a dropped assistant
+// turn, so the head is never left with an orphaned assistant turn. Returns 0
+// (no split) when budgetChars is 0/negative or msgs already fits.
+func trimSplitIndex(msgs []local.Message, budgetChars int) int {
+	if budgetChars <= 0 || messagesCharCount(msgs) <= budgetChars {
+		return 0
+	}
+	idx := 0
+	for messagesCharCount(msgs[idx:]) > budgetChars && idx < len(msgs) {
+		idx++
+		for idx < len(msgs) && msgs[idx].Role != "user" {
+			idx++
+		}
+	}
+	return idx
+}
+
+// trimLocalMessages drops the oldest user+assistant pairs from msgs until the
+// total character count is within budgetChars. Tool-result messages that follow
+// a dropped assistant turn are also dropped. Returns the trimmed slice and true
+// when any trimming occurred. budgetChars == 0 means no limit.
+func trimLocalMessages(msgs []local.Message, budgetChars int) ([]local.Message, bool) {
+	idx := trimSplitIndex(msgs, budgetChars)
+	if idx == 0 {
+		return msgs, false
+	}
+	return msgs[idx:], true
+}
+
+// trimLocalMessagesWithCompaction is like trimLocalMessages, but instead of
+// silently discarding the messages that would be dropped, it makes one extra
+// inference call (via agent.Summarize) to condense exactly that span into a
+// single system message, and splices the summary in ahead of the kept tail.
+// Falls back to a plain hard-drop (trimLocalMessages' behavior) when
+// agent is nil, there is nothing worth summarizing, or the summarization
+// call itself fails (unsupported provider, network error, etc.) — a failed
+// compaction attempt must never block the turn.
+// See docs/prompt-context-management-review.md §8 rec #4.
+func trimLocalMessagesWithCompaction(ctx context.Context, agent *local.Agent, sess *session.Session, msgs []local.Message, budgetChars int) ([]local.Message, bool) {
+	idx := trimSplitIndex(msgs, budgetChars)
+	if idx == 0 {
+		return msgs, false
+	}
+	dropped, kept := msgs[:idx], msgs[idx:]
+	if agent == nil {
+		return kept, true
+	}
+
+	var b strings.Builder
+	for _, m := range dropped {
+		if m.Content == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "[%s]: %s\n", m.Role, m.Content)
+	}
+	if b.Len() == 0 {
+		return kept, true
+	}
+
+	summary, usage, err := agent.Summarize(ctx, b.String())
+	if err != nil || summary == "" {
+		return kept, true
+	}
+	if sess != nil {
+		sess.AddTokens(agent.ModelName(), agent.LogRole()+":compaction", usage.Prompt, usage.Completion)
+	}
+	summaryMsg := local.Message{
+		Role:    "system",
+		Content: "[Summary of earlier conversation, compacted to save context]\n" + summary,
+	}
+	return append([]local.Message{summaryMsg}, kept...), true
+}
+
+// sessionToUnifiedMessages converts session history to the local agent's Message format,
+// sessionToUnifiedMessages builds history for the primary agent using buildAgentHistory.
+// Context size is managed by trimLocalMessages using the agent's message_budget_chars.
+func sessionToUnifiedMessages(sess *session.Session, selfName string, skipOtherAgents bool) []local.Message {
+	return buildAgentHistory(sess, 0, session.AgentLocal, selfName, skipOtherAgents)
+}
+
+func runList(all bool) error {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf(errGettingCWD, err)
+	}
+	target := cwd
+	if all {
+		target = ""
+	}
+	entries, err := session.List(target)
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		fmt.Println("no sessions found")
+		return nil
+	}
+	for dir, list := range entries {
+		fmt.Printf("%s\n", dir)
+		for _, e := range list {
+			name := e.Name
+			if name == "" {
+				name = "(unnamed)"
+			}
+			fmt.Printf("  %s  %-20s  %s\n", e.ID[:8], name, e.LastUsed.Format("2006-01-02 15:04"))
+		}
+	}
+	return nil
+}
+
+func runDrop() error {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf(errGettingCWD, err)
+	}
+	sess, err := session.Resume(cwd, flagSession)
+	if err != nil {
+		return fmt.Errorf("loading session: %w", err)
+	}
+	if err := session.Drop(sess.ID, cwd); err != nil {
+		return err
+	}
+	fmt.Printf("dropped session %s\n", sess.ID[:8])
+	// Pre-create a fresh empty session so the next plain `milk` invocation
+	// starts clean rather than resuming the next oldest session in the index.
+	if _, err := session.New(cwd, flagSession); err != nil {
+		fmt.Fprintf(os.Stderr, "%s warning: could not create fresh session: %v\n", milkTag(), err)
+	}
+	return nil
+}
+
+// perceptsForEscalation returns the content strings of percepts that Claude
+// should receive: those not exclusively targeted at the local agent and not
+// already produced by Claude (to avoid echo loops). Results are relevance-gated
+// against the prompt and size-capped per config before returning.
+// perceptsForAgent returns the percepts that should be injected for the given agent.
+// forEscalation=true filters out ConsumerLocal percepts and ProducerEscalation percepts
+// (Claude wrote them; no need to echo them back). forEscalation=false (primary) filters
+// out ConsumerEscalation percepts only — the primary should receive all other percepts
+// including those produced by the escalation agent.
+func perceptsForAgent(cfg config.Config, mem *memory.Store, prompt string, forEscalation bool) []string {
+	if mem == nil {
+		return nil
+	}
+	// List returns percepts sorted by weight descending — required for LimitInjection.
+	all := mem.List(memory.ListOpts{})
+	var candidates []memory.Percept
+	for _, p := range all {
+		if forEscalation {
+			if p.Producer == memory.ProducerEscalation {
+				continue // Claude wrote it; no need to echo it back
+			}
+			if p.Consumer == memory.ConsumerLocal {
+				continue // explicitly local-only
+			}
+		} else {
+			if p.Consumer == memory.ConsumerEscalation {
+				continue // explicitly escalation-only
+			}
+		}
+		candidates = append(candidates, p)
+	}
+
+	ac := cfg.EscalationAgentConfig()
+	if !forEscalation {
+		ac = cfg.ActiveAgent()
+	}
+	if cfg.AgentPerceptRelevanceGateEnabled(ac) {
+		candidates = memory.FilterByRelevance(candidates, prompt)
+	}
+
+	candidates = memory.LimitInjection(candidates, cfg.AgentPerceptInjectMaxCount(ac), cfg.AgentPerceptInjectMaxByteCount(ac))
+
+	out := make([]string, len(candidates))
+	for i, p := range candidates {
+		out[i] = p.Content
+	}
+	return out
+}
+
+// runInitWizard runs the CLI-mode init wizard, writes ~/.milk/config.json,
+// and prints next-step guidance on success.
+func runInitWizard() error {
+	sc := bufio.NewScanner(os.Stdin)
+	ask := func(prompt string) string {
+		fmt.Print(prompt)
+		if !sc.Scan() {
+			return ""
+		}
+		return strings.TrimSpace(sc.Text())
+	}
+	askDefault := func(prompt, def string) string {
+		v := ask(prompt)
+		if v == "" {
+			return def
+		}
+		return v
+	}
+
+	fmt.Println("milk config init — interactive setup")
+	fmt.Println()
+
+	name := askDefault("Primary agent name [local]: ", "local")
+
+	fmt.Println()
+	fmt.Println("Select primary agent provider:")
+	fmt.Println("  1) local        — llama.cpp, Ollama, vLLM, LM Studio (plain HTTP)")
+	fmt.Println("  2) bedrock      — AWS Bedrock Converse API")
+	fmt.Println("  3) bearer       — OpenRouter, Together.ai, Groq, GitHub Copilot, any Bearer-token API")
+	fmt.Println("  4) claude-cli   — Claude Code CLI subprocess (no HTTP server needed)")
+	fmt.Println("  5) aider-cli    — aider subprocess")
+	fmt.Println("  6) subprocess   — generic NDJSON subprocess agent")
+	choice := askDefault("Choice [1]: ", "1")
+	providerMap := map[string]string{
+		"1": "local", "2": "bedrock", "3": "bearer",
+		"4": "claude-cli", "5": "aider-cli", "6": "subprocess",
+	}
+	provider, ok := providerMap[choice]
+	if !ok {
+		provider = "local"
+	}
+
+	primary := config.AgentConfig{Name: name, Provider: provider}
+	fmt.Println()
+	switch provider {
+	case "local":
+		primary.URL = ask("Server URL (e.g. http://localhost:8080): ")
+		primary.Model = ask("Model name: ")
+	case "bedrock":
+		primary.URL = ask("Bedrock endpoint URL (e.g. https://bedrock-runtime.<region>.amazonaws.com): ")
+		primary.Model = ask("Model ARN: ")
+		primary.AWSRegion = ask("AWS region (e.g. us-east-1): ")
+	case "bearer":
+		primary.URL = ask("Server URL (e.g. https://openrouter.ai/api/v1  ·  https://copilot-api.<org>.ghe.com  ·  https://<res>.cognitiveservices.azure.com/openai): ")
+		switch {
+		case isCopilotURL(primary.URL):
+			primary.Headers = map[string]string{
+				"Copilot-Integration-Id": "vscode-chat",
+				"Editor-Plugin-Version":  "copilot-chat/0.49.0",
+				"Editor-Version":         "vscode/1.121.0",
+				"X-GitHub-Api-Version":   "2026-01-09",
+			}
+			fmt.Println("  (GitHub Copilot detected — headers preset automatically)")
+			chatPath := askDefault("Chat path [/chat/completions]: ", "/chat/completions")
+			if chatPath != "/v1/chat/completions" {
+				primary.ChatPath = chatPath
+			}
+			primary.Model = ask("Model name (e.g. claude-sonnet-4.6 or gpt-4o): ")
+			hint := "gh auth token"
+			if h := copilotHostname(primary.URL); h != "" {
+				hint = "gh auth token --hostname " + h
+			}
+			apiKey := ask("API key (leave blank to use token_cmd instead): ")
+			if apiKey != "" {
+				primary.APIKey = apiKey
+			} else {
+				primary.TokenCmd = askDefault(fmt.Sprintf("Token command [%s]: ", hint), hint)
+			}
+		case isAzureURL(primary.URL):
+			fmt.Println("  (Azure OpenAI detected — api-key header will be used)")
+			dep := azureDeployment(primary.URL)
+			primary.Model = askDefault("Deployment/model name (e.g. gpt-4.1): ", dep)
+			defPath := "/deployments/" + primary.Model + "/chat/completions"
+			chatPath := askDefault(fmt.Sprintf("Chat path [%s]: ", defPath), defPath)
+			if chatPath != "/v1/chat/completions" {
+				primary.ChatPath = chatPath
+			}
+			apiKey := ask("Azure API key: ")
+			if apiKey != "" {
+				primary.Headers = map[string]string{"api-key": apiKey}
+			}
+		default:
+			chatPath := askDefault("Chat path [/v1/chat/completions]: ", "/v1/chat/completions")
+			if chatPath != "/v1/chat/completions" {
+				primary.ChatPath = chatPath
+			}
+			primary.Model = ask("Model name: ")
+			apiKey := ask("API key (leave blank to use token_cmd instead): ")
+			if apiKey != "" {
+				primary.APIKey = apiKey
+			} else {
+				primary.TokenCmd = ask("Token command (e.g. 'gh auth token' or 'op read op://vault/item/field'): ")
+			}
+		}
+	case "aider-cli", "subprocess":
+		primary.URL = ask("Server URL: ")
+		primary.Model = ask("Model name: ")
+	case "claude-cli":
+		// nothing required
+	}
+
+	fmt.Println()
+	escChoice := askDefault("Escalation agent — use Claude Code CLI? [Y/n]: ", "y")
+	var escalation *config.AgentConfig
+	if strings.ToLower(escChoice) != "n" {
+		e := config.AgentConfig{Name: "claude", Provider: "claude-cli"}
+		escalation = &e
+	}
+
+	cfg := config.InitConfig(primary, escalation)
+	scope := "global"
+	if flagLocal {
+		scope = "local"
+	} else if flagGlobal {
+		scope = "global"
+	} else {
+		scope = promptLocalOrGlobal()
+	}
+	if err := saveConfigForScope(cfg, scope); err != nil {
+		return fmt.Errorf("saving config: %w", err)
+	}
+
+	scopeLabel := "~/.milk/config.json"
+	if scope == "local" {
+		scopeLabel = ".milk/config.json"
+	}
+	fmt.Println()
+	fmt.Printf("config written to %s\n", scopeLabel)
+	fmt.Println()
+	fmt.Println("next steps:")
+	fmt.Println("  milk               — start the TUI")
+	fmt.Println("  milk /config init  — re-run this wizard inside the TUI")
+	if escalation != nil {
+		fmt.Println("  /escalate          — pin a turn to Claude Code for complex work")
+	}
+	if primary.Provider == "bedrock" {
+		fmt.Println()
+		fmt.Println("tip: if you use short-lived STS credentials, add aws_refresh_cmd to your agent config to auto-renew on 403")
+	}
+	if isCopilotURL(primary.URL) || isAzureURL(primary.URL) {
+		fmt.Println()
+		fmt.Println("tip: set limits.message_budget_chars in your agent config to cap context size (e.g. 800000 for Copilot/Azure)")
+	}
+	return nil
+}
+
+var configCmd = &cobra.Command{
+	Use:   "config",
+	Short: "Print config as JSON (milk config open | init for more)",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runConfigPrint()
+	},
+}
+
+func init() {
+	configCmd.PersistentFlags().BoolVar(&flagLocal, "local", false, "Write to .milk/config.json in the current directory (project-local)")
+	configCmd.PersistentFlags().BoolVar(&flagGlobal, "global", false, "Write to ~/.milk/config.json (global default)")
+
+	configCmd.AddCommand(&cobra.Command{
+		Use:   "init",
+		Short: "Interactive setup wizard — configure primary and escalation agents",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runInitWizard()
+		},
+	})
+	configCmd.AddCommand(&cobra.Command{
+		Use:   "open",
+		Short: "Open config in $EDITOR or system default editor",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runConfigOpen()
+		},
+	})
+	configCmd.AddCommand(&cobra.Command{
+		Use:   "show",
+		Short: "Show merged config with field source annotations (global/local/default)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runConfigShow()
+		},
+	})
+	configCmd.AddCommand(&cobra.Command{
+		Use:   "docs [topic]",
+		Short: `Look up how to manage milk's own config (e.g. "mcp add", "agent add") — omit topic to list them`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runConfigDocs(strings.Join(args, " "))
+		},
+	})
+	configCmd.AddCommand(newConfigMCPCmd())
+	configCmd.AddCommand(newConfigAgentCmd())
+}
+
+// runConfigDocs prints selfdocs.Lookup(topic), or the full topic list when
+// topic is empty. Headless equivalent of the milk_config_help tool — the
+// route any agent with shell access uses instead of guessing config.json's
+// schema.
+func runConfigDocs(topic string) error {
+	topic = strings.TrimSpace(topic)
+	if topic == "" {
+		for _, t := range selfdocs.Topics() {
+			fmt.Println(t)
+		}
+		return nil
+	}
+	body, ok := selfdocs.Lookup(topic)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "no doc section for %q — available topics:\n", topic)
+		for _, t := range selfdocs.Topics() {
+			fmt.Fprintln(os.Stderr, "  "+t)
+		}
+		return fmt.Errorf("unknown topic %q", topic)
+	}
+	fmt.Println(body)
+	return nil
+}
+
+// printConfigWarnings surfaces config.Validate warnings for a would-be config
+// without blocking the write — Validate never hard-fails by design.
+func printConfigWarnings(cfg config.Config) {
+	for _, w := range config.Validate(cfg) {
+		fmt.Fprintln(os.Stderr, "warning: "+w.String())
+	}
+}
+
+// newConfigMCPCmd builds "milk config mcp add|assign|unassign" — the headless
+// equivalent of the TUI's /mcp add|assign|unassign, sharing the same
+// validated write path (config.UpsertMCPServer, assignMCPServer) so an agent
+// invoking this via its shell tool gets identical dedup/normalisation
+// behavior to the interactive wizard.
+func newConfigMCPCmd() *cobra.Command {
+	mcpCmd := &cobra.Command{Use: "mcp", Short: "Manage MCP servers headlessly"}
+	mcpCmd.AddCommand(&cobra.Command{
+		Use:   "add [key=val ...]",
+		Short: "Add or update an MCP server: name=... url=... (or command=... for stdio)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runConfigMCPAdd(strings.Join(args, " "))
+		},
+	})
+	mcpCmd.AddCommand(&cobra.Command{
+		Use:   "assign <server> <agent>",
+		Short: "Assign an MCP server to an agent",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runConfigMCPAssign(args[0], args[1], true)
+		},
+	})
+	mcpCmd.AddCommand(&cobra.Command{
+		Use:   "unassign <server> <agent>",
+		Short: "Unassign an MCP server from an agent",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runConfigMCPAssign(args[0], args[1], false)
+		},
+	})
+	mcpCmd.AddCommand(&cobra.Command{
+		Use:   "remove <server>",
+		Short: "Remove an MCP server and clean up any agent references to it",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runConfigMCPRemove(args[0])
+		},
+	})
+	return mcpCmd
+}
+
+func runConfigMCPRemove(name string) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	if !removeMCPServer(&cfg, name) {
+		return fmt.Errorf("MCP server %q not found", name)
+	}
+	scope := promptScopeIfNeeded()
+	if err := saveConfigForScope(cfg, scope); err != nil {
+		return err
+	}
+	fmt.Printf("MCP server %q removed (saved to %s)\n", name, scope)
+	return nil
+}
+
+func runConfigMCPAdd(inline string) error {
+	sc := parseMCPInlineArgs(inline)
+	if sc.Name == "" {
+		return fmt.Errorf(`usage: milk config mcp add name=<name> url=<url> [transport=http|stdio] [auth=bearer|token_cmd|oauth] [api_key=...] [token_cmd=...] [command=...] [args=a,b,c] [timeout=30s]`)
+	}
+	isStdio := strings.EqualFold(sc.Transport, "stdio")
+	if isStdio && sc.Command == "" {
+		return fmt.Errorf("transport=stdio requires command=<path>")
+	}
+	if !isStdio && sc.URL == "" {
+		return fmt.Errorf("requires url=<url> (or transport=stdio command=<path>)")
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	updated := config.UpsertMCPServer(&cfg, sc)
+	printConfigWarnings(cfg)
+	scope := promptScopeIfNeeded()
+	if err := saveConfigForScope(cfg, scope); err != nil {
+		return err
+	}
+	verb := "added"
+	if updated {
+		verb = "updated"
+	}
+	fmt.Printf("MCP server %q %s (saved to %s) — use \"milk config mcp assign %s <agent>\" to expose it\n", sc.Name, verb, scope, sc.Name)
+	return nil
+}
+
+func runConfigMCPAssign(serverName, agentName string, assign bool) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	switch assignMCPServer(&cfg, serverName, agentName, assign) {
+	case mcpAssignServerNotFound:
+		return fmt.Errorf(`MCP server %q not found — add it first with "milk config mcp add"`, serverName)
+	case mcpAssignAgentNotFound:
+		return fmt.Errorf("agent %q not found", agentName)
+	case mcpAssignNoop:
+		if assign {
+			fmt.Printf("MCP server %q already assigned to agent %q\n", serverName, agentName)
+		} else {
+			fmt.Printf("MCP server %q not assigned to agent %q\n", serverName, agentName)
+		}
+		return nil
+	}
+	scope := promptScopeIfNeeded()
+	if err := saveConfigForScope(cfg, scope); err != nil {
+		return err
+	}
+	verb := "assigned to"
+	if !assign {
+		verb = "unassigned from"
+	}
+	fmt.Printf("MCP server %q %s agent %q (saved to %s)\n", serverName, verb, agentName, scope)
+	return nil
+}
+
+// newConfigAgentCmd builds "milk config agent add" — the headless equivalent
+// of the TUI's /agent add, minus the live-wiring side effects (router
+// construction, credential-refresh callbacks) that only make sense inside a
+// running TUI process.
+func newConfigAgentCmd() *cobra.Command {
+	agentCmd := &cobra.Command{Use: "agent", Short: "Manage agents headlessly"}
+	agentCmd.AddCommand(&cobra.Command{
+		Use:   "add [key=val ...]",
+		Short: "Add a new agent: name=... provider=... url=... model=... [api_key=...]",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runConfigAgentAdd(strings.Join(args, " "))
+		},
+	})
+	agentCmd.AddCommand(&cobra.Command{
+		Use:   "remove <name>",
+		Short: "Remove an agent (refuses if it's the active primary or escalation agent)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runConfigAgentRemove(args[0])
+		},
+	})
+	return agentCmd
+}
+
+func runConfigAgentRemove(name string) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	outcome, removed := removeAgentConfig(&cfg, name)
+	switch outcome {
+	case agentRemoveIsPrimary:
+		return fmt.Errorf("cannot remove %q — it is the active primary agent (switch first)", name)
+	case agentRemoveIsEscalation:
+		return fmt.Errorf("cannot remove %q — it is the active escalation agent (switch first)", name)
+	case agentRemoveNotFound:
+		return fmt.Errorf("no agent named %q", name)
+	}
+	scope := promptScopeIfNeeded()
+	if err := saveConfigForScope(cfg, scope); err != nil {
+		return err
+	}
+	fmt.Printf("agent %q removed (saved to %s)\n", removed, scope)
+	return nil
+}
+
+func runConfigAgentAdd(inline string) error {
+	ac := parseAgentInlineArgs(inline)
+	if ac.Name == "" {
+		return fmt.Errorf(`usage: milk config agent add name=<name> provider=<provider> url=<url> model=<model> [api_key=...] [bin=...] (see "milk config docs agent add")`)
+	}
+	if step := firstMissingStep(ac); step != addStepDone {
+		return fmt.Errorf(`missing a required field for provider %q — see "milk config docs agent add"`, ac.Provider)
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	if findAgentIdx(cfg, ac.Name) >= 0 {
+		return fmt.Errorf(`agent %q already exists — use "milk config open" to edit it`, ac.Name)
+	}
+	isFirst := len(cfg.Agents) == 0
+	cfg.Agents = append(cfg.Agents, ac)
+	if isFirst {
+		cfg.Agent = ac.Name
+	}
+	printConfigWarnings(cfg)
+	scope := promptScopeIfNeeded()
+	if err := saveConfigForScope(cfg, scope); err != nil {
+		return err
+	}
+	fmt.Printf("agent %q added (saved to %s)\n", ac.Name, scope)
+	return nil
+}
+
+// resolveSaveScope determines whether to save to local or global config.
+// Priority: --local/--global flags > interactive prompt (if local config exists) > global default.
+func resolveSaveScope() string {
+	if flagLocal {
+		return "local"
+	}
+	if flagGlobal {
+		return "global"
+	}
+	if config.HasLocalConfig() {
+		return promptLocalOrGlobal()
+	}
+	return "global"
+}
+
+// promptScopeIfNeeded returns a scope string. When a local config exists and
+// no --local/--global flag was passed, it prompts the user.
+// Used by config-mutating commands (mcp add/remove, agent add/remove, init).
+func promptScopeIfNeeded() string {
+	return resolveSaveScope()
+}
+
+// promptLocalOrGlobal asks the user whether to apply a config change to the
+// local project config or the global config. Defaults to local (Y).
+func promptLocalOrGlobal() string {
+	fmt.Print("Apply to local? [Y/n] ")
+	sc := bufio.NewScanner(os.Stdin)
+	if sc.Scan() {
+		answer := strings.TrimSpace(strings.ToLower(sc.Text()))
+		if answer == "n" || answer == "no" {
+			return "global"
+		}
+	}
+	return "local"
+}
+
+// saveConfigForScope persists cfg to an already-resolved scope ("local" or
+// "global"), creating the local config file first if (and only if) the scope
+// is local. Every CLI config-mutating command must go through this rather
+// than calling ensureLocalConfig unconditionally — doing so previously
+// created a stray .milk/config.json in cwd even on a --global save, which
+// then silently flipped every later command's scope default to "local".
+func saveConfigForScope(cfg config.Config, scope string) error {
+	if scope == "local" {
+		if err := ensureLocalConfig(); err != nil {
+			return err
+		}
+	}
+	return config.SaveScope(cfg, scope)
+}
+
+// ensureLocalConfig creates .milk/config.json with a minimal empty object if
+// it doesn't exist yet. Called after the user answers "Y" to the scope prompt
+// but no local config file is present.
+func ensureLocalConfig() error {
+	p, err := config.LocalConfigPath()
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(p); err == nil {
+		return nil // already exists
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(p, []byte("{}\n"), 0o600)
+}
+
+func runConfigPrint() error {
+	// Show merged config (global + local) with a note if local overrides exist.
+	_, _, merged, hasLocal, err := config.LoadWithLocal()
+	if err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(merged, "", "  ")
+	if err != nil {
+		return err
+	}
+	if hasLocal {
+		fmt.Fprintln(os.Stderr, "# merged config (global + local overrides)")
+	}
+	fmt.Println(string(data))
+	return nil
+}
+
+// runConfigShow prints the merged config with per-field source annotations
+// showing whether each value comes from "local", "global", or "default".
+func runConfigShow() error {
+	global, local, merged, hasLocal, err := config.LoadWithLocal()
+	if err != nil {
+		return err
+	}
+	if !hasLocal {
+		fmt.Fprintln(os.Stderr, "no local config (.milk/config.json) — all values are global")
+		data, err := json.MarshalIndent(global, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(data))
+		return nil
+	}
+
+	// Marshal all three to raw JSON maps for field-by-field comparison.
+	globalRaw, _ := json.Marshal(global)
+	localRaw, _ := json.Marshal(local)
+	mergedRaw, _ := json.Marshal(merged)
+
+	var gMap, lMap, mMap map[string]json.RawMessage
+	json.Unmarshal(globalRaw, &gMap)
+	json.Unmarshal(localRaw, &lMap)
+	json.Unmarshal(mergedRaw, &mMap)
+
+	// Build annotated output: for each field in merged, determine source.
+	// Order: local fields first, then global-only fields, then defaults.
+	seen := make(map[string]bool)
+	var lines []string
+
+	for key, val := range mMap {
+		seen[key] = true
+		source := "default"
+		if _, inLocal := lMap[key]; inLocal {
+			source = "local"
+		} else if _, inGlobal := gMap[key]; inGlobal {
+			source = "global"
+		}
+		lines = append(lines, fmt.Sprintf("  // [%s] %s: %s", source, key, string(val)))
+	}
+
+	sort.Strings(lines)
+	fmt.Fprintln(os.Stderr, "# merged config — field sources: [local] [global] [default]")
+	fmt.Fprintln(os.Stderr, "# local overrides global; unset fields fall back to global, then defaults")
+	fmt.Println("{")
+	for _, l := range lines {
+		fmt.Println(l)
+	}
+	fmt.Println("}")
+
+	// Also print the full merged JSON for machine consumption.
+	fmt.Fprintln(os.Stderr)
+	fullData, _ := json.MarshalIndent(merged, "", "  ")
+	fmt.Println(string(fullData))
+	return nil
+}
+
+func runConfigOpen() error {
+	// Determine which config file to open:
+	// --local  → .milk/config.json (create if missing)
+	// --global → ~/.milk/config.json
+	// default  → local if exists, else global
+	cfgPath := ""
+	if flagLocal {
+		p, err := config.LocalConfigPath()
+		if err != nil {
+			return err
+		}
+		if err := ensureLocalConfig(); err != nil {
+			return err
+		}
+		cfgPath = p
+	} else if flagGlobal {
+		dir, err := config.Dir()
+		if err != nil {
+			return err
+		}
+		cfgPath = filepath.Join(dir, "config.json")
+	} else if config.HasLocalConfig() {
+		p, err := config.LocalConfigPath()
+		if err != nil {
+			return err
+		}
+		cfgPath = p
+	} else {
+		dir, err := config.Dir()
+		if err != nil {
+			return err
+		}
+		cfgPath = filepath.Join(dir, "config.json")
+	}
+
+	// Load config to check for config_editors override.
+	cfg, _ := config.Load()
+
+	// Build candidate list from config_editors (with env expansion) or built-in defaults.
+	// $EDITOR and $VISUAL are regular entries, expanded at runtime.
+	defaultEditors := []string{"$EDITOR", "$VISUAL", "nano", "vim", "vi"}
+	list := cfg.ConfigEditors
+	if len(list) == 0 {
+		list = defaultEditors
+	}
+	var candidates []string
+	for _, e := range list {
+		expanded := os.ExpandEnv(e)
+		if expanded != "" {
+			candidates = append(candidates, expanded)
+		}
+	}
+
+	var editorCmd string
+	var editorArgs []string
+	for _, c := range candidates {
+		parts := strings.Fields(c)
+		if len(parts) == 0 {
+			continue
+		}
+		if _, lerr := exec.LookPath(parts[0]); lerr == nil {
+			editorCmd = parts[0]
+			editorArgs = parts[1:]
+			break
+		}
+	}
+	if editorCmd == "" {
+		return fmt.Errorf("no editor found — set $EDITOR or configure config_editors in config")
+	}
+
+	// If opening local config that inherits from global, print a helpful note.
+	if config.HasLocalConfig() && cfgPath != filepath.Join(func() string { d, _ := config.Dir(); return d }(), "config.json") {
+		fmt.Fprintf(os.Stderr, "opening local config (inherits unset fields from global)\n")
+	}
+
+	cmd := exec.Command(editorCmd, append(editorArgs, cfgPath)...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	return cmd.Run()
+}
+
+// ── otel command ──────────────────────────────────────────────────────────────
+
+var otelCmd = &cobra.Command{
+	Use:   "otel",
+	Short: "Manage observability settings",
+}
+
+func init() {
+	debugCmd := &cobra.Command{
+		Use:   "debug",
+		Short: "Enable or disable full debug logging",
+	}
+	debugCmd.AddCommand(&cobra.Command{
+		Use:   "enable",
+		Short: "Enable debug logging (log_context, debug_claude_code, debug_local, log_level=DEBUG)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := runOtelDebug(true); err != nil {
+				return err
+			}
+			cliPath, _ := config.CLIDebugLogPath()
+			localPath, _ := config.LocalDebugLogPath()
+			subprocessPath, _ := config.SubprocessDebugLogPath()
+			otelDir, _ := config.OtelDir()
+			fmt.Printf("debug logging enabled\n  claude NDJSON → %s\n  local SSE     → %s\n  subprocess    → %s\n  payloads      → %s/logs.jsonl\n", cliPath, localPath, subprocessPath, otelDir)
+			return nil
+		},
+	})
+	debugCmd.AddCommand(&cobra.Command{
+		Use:   "disable",
+		Short: "Disable debug logging (restores log_level to pre-debug value; default INFO)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := runOtelDebug(false); err != nil {
+				return err
+			}
+			fmt.Println("debug logging disabled")
+			return nil
+		},
+	})
+	otelCmd.AddCommand(debugCmd)
+}
+
+// updateCmd is the `milk update` subcommand — check and apply updates non-interactively.
+var updateCmd = &cobra.Command{
+	Use:   "update",
+	Short: "Check for and install milk updates",
+}
+
+func init() {
+	updateCmd.AddCommand(&cobra.Command{
+		Use:   "check",
+		Short: "Check whether a newer release is available",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return fmt.Errorf("loading config: %w", err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+
+			fmt.Printf("current version: %s\n", version)
+			fmt.Println("checking for updates…")
+			rel, err := updater.CheckLatest(ctx, version, cfg.UpdateCheckIncludePrerelease())
+			if err != nil {
+				return fmt.Errorf("update check: %w", err)
+			}
+			if rel == nil {
+				fmt.Println("already up to date")
+				return nil
+			}
+			fmt.Printf("update available: %s  %s\n", rel.Tag, rel.HTMLURL)
+			fmt.Println("run `milk update install` to apply")
+			return nil
+		},
+	})
+	updateCmd.AddCommand(&cobra.Command{
+		Use:   "install",
+		Short: "Download and install the latest release",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return fmt.Errorf("loading config: %w", err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+
+			fmt.Printf("current version: %s\n", version)
+			fmt.Println("checking for updates…")
+			rel, err := updater.CheckLatest(ctx, version, cfg.UpdateCheckIncludePrerelease())
+			if err != nil {
+				return fmt.Errorf("update check: %w", err)
+			}
+			if rel == nil {
+				fmt.Println("already up to date")
+				return nil
+			}
+			fmt.Printf("update available: %s\n", rel.Tag)
+
+			dest, err := updater.CurrentBinaryPath()
+			if err != nil {
+				return fmt.Errorf("resolving binary path: %w", err)
+			}
+			fmt.Printf("installing to %s…\n", dest)
+			err = updater.Apply(ctx, rel, dest, func(done, total int64) {
+				if total > 0 {
+					fmt.Printf("\r  %d%% (%d / %d bytes)", 100*done/total, done, total)
+				}
+			})
+			fmt.Println()
+			if err != nil {
+				if errors.Is(err, updater.ErrWindowsManual) {
+					fmt.Printf("Windows: replace %s manually with the downloaded binary\n", dest)
+					return nil
+				}
+				return fmt.Errorf("install: %w", err)
+			}
+			fmt.Printf("installed %s — restart milk to use the new version\n", rel.Tag)
+			return nil
+		},
+	})
+}
+
+// runOtelDebug enables or disables the full debug logging bundle.
+// On enable: saves the current log_level to pre_debug_log_level, then sets DEBUG.
+// On disable: restores log_level from pre_debug_log_level (falling back to INFO).
+func runOtelDebug(enable bool) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("loading config: %w", err)
+	}
+	cfg.Otel.LogContext = enable
+	if enable {
+		// Snapshot the current level so disable can restore it.
+		if !strings.EqualFold(cfg.Otel.LogLevel, "DEBUG") {
+			cfg.Otel.PreDebugLogLevel = cfg.Otel.LogLevel
+		}
+		cfg.Otel.LogLevel = "DEBUG"
+	} else {
+		prev := cfg.Otel.PreDebugLogLevel
+		if prev == "" || strings.EqualFold(prev, "DEBUG") {
+			prev = "INFO"
+		}
+		cfg.Otel.LogLevel = prev
+		cfg.Otel.PreDebugLogLevel = ""
+	}
+	cfg.DebugCLILog = enable
+	cfg.DebugLocalLog = enable
+	cfg.DebugSubprocessLog = enable
+	if err := config.SaveScope(cfg, resolveSaveScope()); err != nil {
+		return fmt.Errorf("saving config: %w", err)
+	}
+	return nil
+}
+
+// ── milk server ──────────────────────────────────────────────────────────────
+
+var serverCmd = &cobra.Command{
+	Use:   "server",
+	Short: "Manage the local inference server process",
+}
+
+func init() {
+	serverCmd.AddCommand(&cobra.Command{
+		Use:   "start [agent]",
+		Short: "Start the inference server for a local agent",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return fmt.Errorf("loading config: %w", err)
+			}
+			ac, err := resolveServerAgent(cfg, args)
+			if err != nil {
+				return err
+			}
+			if ac.RunCmd == "" {
+				return fmt.Errorf("agent %q has no run_cmd configured", ac.Name)
+			}
+			if isReachable(ac.URL) {
+				fmt.Printf("server for %q is already reachable at %s\n", ac.Name, ac.URL)
+				return nil
+			}
+			fmt.Printf("starting server for %q…\n", ac.Name)
+			ctx, cancel := context.WithTimeout(context.Background(), 70*time.Second)
+			defer cancel()
+			if err := ensureServerRunning(ctx, ac.URL, ac.RunCmd, ac.Name); err != nil {
+				return fmt.Errorf("start: %w", err)
+			}
+			pid, _ := readPID(ac.Name)
+			if pid != 0 {
+				fmt.Printf("server started  pid=%d  url=%s\n", pid, ac.URL)
+			} else {
+				fmt.Printf("server started  url=%s\n", ac.URL)
+			}
+			return nil
+		},
+	})
+
+	serverCmd.AddCommand(&cobra.Command{
+		Use:   "stop [agent]",
+		Short: "Stop the inference server tracked for a local agent",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return fmt.Errorf("loading config: %w", err)
+			}
+			ac, err := resolveServerAgent(cfg, args)
+			if err != nil {
+				return err
+			}
+			stopped, err := serverStop(ac.Name)
+			if err != nil {
+				return fmt.Errorf("stop: %w", err)
+			}
+			if !stopped {
+				fmt.Printf("no tracked server process for %q (not started by milk)\n", ac.Name)
+				return nil
+			}
+			fmt.Printf("server for %q stopped\n", ac.Name)
+			return nil
+		},
+	})
+
+	serverCmd.AddCommand(&cobra.Command{
+		Use:   "status [agent]",
+		Short: "Show the status of the inference server for a local agent",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return fmt.Errorf("loading config: %w", err)
+			}
+			ac, err := resolveServerAgent(cfg, args)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("%s: %s\n", ac.Name, serverStatus(ac.Name, ac.URL))
+			return nil
+		},
+	})
+}
+
+// resolveServerAgent returns the AgentConfig to use for a server subcommand.
+// If args is empty, returns the active local agent. If args[0] is given, finds
+// the matching agent by name.
+func resolveServerAgent(cfg config.Config, args []string) (config.AgentConfig, error) {
+	if len(args) == 0 {
+		return activeLocalAgentConfig(cfg), nil
+	}
+	name := args[0]
+	for _, a := range cfg.Agents {
+		if strings.EqualFold(a.Name, name) {
+			return a, nil
+		}
+	}
+	return config.AgentConfig{}, fmt.Errorf("no agent named %q in config", name)
+}

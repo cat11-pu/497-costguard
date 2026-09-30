@@ -1,0 +1,689 @@
+package local
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/scoutme/milk/internal/config"
+	"github.com/scoutme/milk/internal/session"
+)
+
+func TestChatRequest_NilHistorySerializesAsArray(t *testing.T) {
+	// llama.cpp rejects {"messages":null}; must be {"messages":[...]}
+	req := chatRequest{
+		Model:    "test",
+		Messages: []Message{{Role: "user", Content: "hi"}},
+	}
+	b, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), `"messages":null`) {
+		t.Error("messages must not serialize as null")
+	}
+	if !strings.Contains(string(b), `"messages":[`) {
+		t.Errorf("messages must serialize as array, got: %s", b)
+	}
+}
+
+func TestRunBash_Success(t *testing.T) {
+	result, escalate := dispatchTool(context.Background(), "bash", `{"command":"echo hello"}`, nil, nil, "", nil)
+	if escalate {
+		t.Fatal("unexpected escalation signal")
+	}
+	if !strings.Contains(result, "hello") {
+		t.Errorf("expected 'hello' in output, got %q", result)
+	}
+}
+
+func TestRunBash_NonZeroExit(t *testing.T) {
+	result, _ := dispatchTool(context.Background(), "bash", `{"command":"exit 42"}`, nil, nil, "", nil)
+	if !strings.Contains(result, "42") {
+		t.Errorf("expected exit code 42 in result, got %q", result)
+	}
+}
+
+func TestRunBash_InvalidJSON(t *testing.T) {
+	result, _ := dispatchTool(context.Background(), "bash", `not json`, nil, nil, "", nil)
+	if !strings.Contains(result, "invalid arguments") {
+		t.Errorf("expected error message, got %q", result)
+	}
+}
+
+func TestRunGrep_FindsMatch(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "test.txt")
+	os.WriteFile(f, []byte("hello world\ngoodbye world\n"), 0o600)
+
+	result, _ := dispatchTool(context.Background(), "grep", `{"pattern":"hello","path":"`+f+`"}`, nil, nil, "", nil)
+	if !strings.Contains(result, "hello") {
+		t.Errorf("expected match in output, got %q", result)
+	}
+}
+
+func TestRunGrep_Recursive(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "sub")
+	os.MkdirAll(sub, 0o700)
+	os.WriteFile(filepath.Join(sub, "a.txt"), []byte("needle\n"), 0o600)
+
+	result, _ := dispatchTool(context.Background(), "grep", `{"pattern":"needle","path":"`+dir+`","recursive":true}`, nil, nil, "", nil)
+	if !strings.Contains(result, "needle") {
+		t.Errorf("expected recursive match, got %q", result)
+	}
+}
+
+func TestRunGrep_NoMatch(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "test.txt")
+	os.WriteFile(f, []byte("nothing here\n"), 0o600)
+
+	result, _ := dispatchTool(context.Background(), "grep", `{"pattern":"xyzzy","path":"`+f+`"}`, nil, nil, "", nil)
+	// grep exit code 1 = no match; should get a result, not an error from dispatchTool
+	if strings.Contains(result, "invalid") {
+		t.Errorf("unexpected error for no-match grep: %q", result)
+	}
+}
+
+func TestReadFile_ReturnsNumberedLines(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "sample.txt")
+	os.WriteFile(f, []byte("line1\nline2\nline3\n"), 0o600)
+
+	result, _ := dispatchTool(context.Background(), "read_file", `{"path":"`+f+`"}`, nil, nil, "", nil)
+	// result is JSON: {"output":"1\tline1\n..."}
+	if !strings.Contains(result, `1\tline1`) {
+		t.Errorf("expected numbered lines, got %q", result)
+	}
+	if !strings.Contains(result, `3\tline3`) {
+		t.Errorf("expected line 3, got %q", result)
+	}
+}
+
+func TestReadFile_OffsetAndLimit(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "sample.txt")
+	os.WriteFile(f, []byte("a\nb\nc\nd\ne\n"), 0o600)
+
+	// offset=1 skips line index 0 ("a"); limit=2 returns lines at index 1,2 ("b","c")
+	// line numbers are 1-based from offset: index 1 → number 2, index 2 → number 3
+	result, _ := dispatchTool(context.Background(), "read_file", `{"path":"`+f+`","offset":1,"limit":2}`, nil, nil, "", nil)
+	if strings.Contains(result, `1\ta`) {
+		t.Error("offset=1 should skip first line")
+	}
+	if !strings.Contains(result, `2\tb`) {
+		t.Errorf("expected line b at position 2, got %q", result)
+	}
+	if strings.Contains(result, `4\td`) {
+		t.Error("limit=2 should stop before line d")
+	}
+}
+
+func TestReadFile_DefaultLimitCapsAtMaxReadLines(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "big.txt")
+	var b strings.Builder
+	total := maxReadLines + 500
+	for i := 1; i <= total; i++ {
+		fmt.Fprintf(&b, "line%d\n", i)
+	}
+	os.WriteFile(f, []byte(b.String()), 0o600)
+	// The trailing "\n" after the last line produces one extra empty element
+	// when the file content is split on "\n" — the truncation notice reports
+	// that raw line count, not the number of non-empty lines written.
+	splitLines := total + 1
+
+	result, _ := dispatchTool(context.Background(), "read_file", `{"path":"`+f+`"}`, nil, nil, "", nil)
+	if !strings.Contains(result, fmt.Sprintf(`%d\tline%d`, maxReadLines, maxReadLines)) {
+		t.Errorf("expected the default read to reach line %d, got %q", maxReadLines, result)
+	}
+	if strings.Contains(result, fmt.Sprintf(`%d\tline%d`, maxReadLines+1, maxReadLines+1)) {
+		t.Errorf("expected the default read to stop at %d lines, got %q", maxReadLines, result)
+	}
+	if !strings.Contains(result, fmt.Sprintf("showed lines 1-%d of %d", maxReadLines, splitLines)) {
+		t.Errorf("expected a truncation notice naming the default cap, got %q", result)
+	}
+}
+
+func TestReadFile_MissingFile(t *testing.T) {
+	result, _ := dispatchTool(context.Background(), "read_file", `{"path":"/nonexistent/file.txt"}`, nil, nil, "", nil)
+	if !strings.Contains(result, "error") && !strings.Contains(result, "no such file") {
+		t.Errorf("expected error for missing file, got %q", result)
+	}
+}
+
+func TestEscalateReturnsSignal(t *testing.T) {
+	_, escalate := dispatchTool(context.Background(), "escalate", `{"reason":"too complex"}`, nil, nil, "", nil)
+	if !escalate {
+		t.Error("expected escalation signal")
+	}
+}
+
+func TestGetSessionContext_Empty(t *testing.T) {
+	result, escalate := dispatchTool(context.Background(), "get_session_context", `{}`, nil, nil, "", nil)
+	if escalate {
+		t.Error("unexpected escalation signal")
+	}
+	if !strings.Contains(result, "no session history") {
+		t.Errorf("expected empty-history message, got %q", result)
+	}
+}
+
+func TestGetSessionContext_WithHistory(t *testing.T) {
+	sess := &session.Session{}
+	sess.AddTurn(session.Turn{Role: session.RoleUser, Content: "hello"})
+	sess.AddTurn(session.Turn{Role: session.RoleAssistant, Agent: session.AgentLocal, Content: "world"})
+
+	result, _ := dispatchTool(context.Background(), "get_session_context", `{}`, sess, nil, "", nil)
+	if !strings.Contains(result, "hello") {
+		t.Errorf("expected user turn in context, got %q", result)
+	}
+	if !strings.Contains(result, "world") {
+		t.Errorf("expected assistant turn in context, got %q", result)
+	}
+}
+
+func TestGetSessionContext_LastN(t *testing.T) {
+	sess := &session.Session{}
+	sess.AddTurn(session.Turn{Role: session.RoleUser, Content: "first"})
+	sess.AddTurn(session.Turn{Role: session.RoleAssistant, Agent: session.AgentLocal, Content: "second"})
+	sess.AddTurn(session.Turn{Role: session.RoleUser, Content: "third"})
+
+	result, _ := dispatchTool(context.Background(), "get_session_context", `{"last_n":1}`, sess, nil, "", nil)
+	if strings.Contains(result, "first") {
+		t.Error("last_n:1 should exclude earlier turns")
+	}
+	if !strings.Contains(result, "third") {
+		t.Errorf("expected last turn in result, got %q", result)
+	}
+}
+
+func TestGetSessionContext_Pattern(t *testing.T) {
+	sess := &session.Session{}
+	sess.AddTurn(session.Turn{Role: session.RoleUser, Content: "needle in a haystack"})
+	sess.AddTurn(session.Turn{Role: session.RoleAssistant, Agent: session.AgentLocal, Content: "unrelated response"})
+
+	result, _ := dispatchTool(context.Background(), "get_session_context", `{"pattern":"needle"}`, sess, nil, "", nil)
+	if !strings.Contains(result, "needle") {
+		t.Errorf("expected matching turn, got %q", result)
+	}
+	if strings.Contains(result, "unrelated") {
+		t.Error("non-matching turn should be excluded")
+	}
+}
+
+func TestGetSessionContext_AgentFilter(t *testing.T) {
+	sess := &session.Session{}
+	sess.AddTurn(session.Turn{Role: session.RoleUser, Content: "question"})
+	sess.AddTurn(session.Turn{Role: session.RoleAssistant, Agent: session.AgentLocal, Content: "local answer"})
+	sess.AddTurn(session.Turn{Role: session.RoleAssistant, Agent: session.AgentEscalation, Content: "claude answer"})
+
+	result, _ := dispatchTool(context.Background(), "get_session_context", `{"agent":"escalation"}`, sess, nil, "", nil)
+	if !strings.Contains(result, "claude answer") {
+		t.Errorf("expected escalation turn, got %q", result)
+	}
+	if strings.Contains(result, "local answer") {
+		t.Error("local turn should be excluded when agent=escalation")
+	}
+}
+
+func TestGetSessionContext_NoMatch(t *testing.T) {
+	sess := &session.Session{}
+	sess.AddTurn(session.Turn{Role: session.RoleUser, Content: "something"})
+
+	result, _ := dispatchTool(context.Background(), "get_session_context", `{"pattern":"xyzzy"}`, sess, nil, "", nil)
+	if !strings.Contains(result, "no matching turns") {
+		t.Errorf("expected no-match message, got %q", result)
+	}
+}
+
+// makeSess builds a session with n user+assistant turn pairs.
+func makeSess(n int) *session.Session {
+	sess := &session.Session{}
+	for i := 1; i <= n; i++ {
+		sess.AddTurn(session.Turn{Role: session.RoleUser, Content: strings.Repeat("u", i)})
+		sess.AddTurn(session.Turn{Role: session.RoleAssistant, Agent: session.AgentLocal, Content: strings.Repeat("a", i)})
+	}
+	return sess
+}
+
+func TestGetSessionContext_CompactOlderHasIndices(t *testing.T) {
+	// 8 pairs = 16 turns; split = 16-10 = 6 older turns → compact with indices
+	sess := makeSess(8)
+	result, _ := dispatchTool(context.Background(), "get_session_context", `{}`, sess, nil, "", nil)
+	if !strings.Contains(result, "[1]") {
+		t.Errorf("expected compact index [1] in output, got %q", result)
+	}
+	if !strings.Contains(result, "older history") {
+		t.Errorf("expected older history header, got %q", result)
+	}
+}
+
+func TestGetSessionContext_SmallOlderVerbatimNoHeader(t *testing.T) {
+	// 6 pairs = 12 turns; split = 12-10 = 2 older turns → ≤5, verbatim, no header
+	sess := makeSess(6)
+	result, _ := dispatchTool(context.Background(), "get_session_context", `{}`, sess, nil, "", nil)
+	if strings.Contains(result, "older history") {
+		t.Errorf("small older portion should be verbatim without header, got %q", result)
+	}
+}
+
+func TestGetSessionContext_RangeVerbatim(t *testing.T) {
+	// 8 pairs → 16 turns; request turns 2-3 verbatim
+	sess := makeSess(8)
+	result, _ := dispatchTool(context.Background(), "get_session_context", `{"turn_from":2,"turn_to":3}`, sess, nil, "", nil)
+	if !strings.Contains(result, "turns 2") {
+		t.Errorf("expected verbatim range header, got %q", result)
+	}
+	// turn 2 is the first assistant turn: content "a" (i=1 in makeSess)
+	if !strings.Contains(result, "primary: a") {
+		t.Errorf("expected verbatim content of turn 2, got %q", result)
+	}
+}
+
+func TestGetSessionContext_RangeClampedToMax(t *testing.T) {
+	// request 10 turns — should be clamped to contextRangeMaxTurns (5)
+	sess := makeSess(10)
+	result, _ := dispatchTool(context.Background(), "get_session_context", `{"turn_from":1,"turn_to":10}`, sess, nil, "", nil)
+	if !strings.Contains(result, "turns 1") {
+		t.Errorf("expected range header, got %q", result)
+	}
+	// turn 6 (content "aaaaaa") must not appear
+	if strings.Contains(result, "aaaaaa") {
+		t.Errorf("range should be clamped to %d turns, but turn 6 appears: %q", contextRangeMaxTurns, result)
+	}
+}
+
+func TestGetSessionContext_RangeOutOfBounds(t *testing.T) {
+	sess := makeSess(2) // 4 turns
+	result, _ := dispatchTool(context.Background(), "get_session_context", `{"turn_from":99}`, sess, nil, "", nil)
+	if !strings.Contains(result, "out of range") {
+		t.Errorf("expected out-of-range message, got %q", result)
+	}
+}
+
+func TestGetSessionContext_RangeDefaultsToFromWhenToOmitted(t *testing.T) {
+	sess := makeSess(8)
+	result, _ := dispatchTool(context.Background(), "get_session_context", `{"turn_from":2}`, sess, nil, "", nil)
+	// header should say "turns 2–2"
+	if !strings.Contains(result, "2") {
+		t.Errorf("expected single-turn range, got %q", result)
+	}
+}
+
+func TestUnknownTool(t *testing.T) {
+	result, escalate := dispatchTool(context.Background(), "nonexistent", `{}`, nil, nil, "", nil)
+	if escalate {
+		t.Error("unexpected escalation signal")
+	}
+	if !strings.Contains(result, "unknown tool") {
+		t.Errorf("expected unknown tool error, got %q", result)
+	}
+}
+
+func TestEditFile_ReplaceAll(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "f.txt")
+	os.WriteFile(f, []byte("foo bar foo"), 0o600)
+
+	args := `{"path":"` + f + `","old_string":"foo","new_string":"baz","replace_all":true}`
+	result, _ := dispatchTool(context.Background(), "edit_file", args, nil, nil, "", nil)
+	if strings.Contains(result, "error") {
+		t.Fatalf("unexpected error: %q", result)
+	}
+	got, _ := os.ReadFile(f)
+	if string(got) != "baz bar baz" {
+		t.Errorf("expected all occurrences replaced, got %q", string(got))
+	}
+}
+
+func TestEditFile_AmbiguousWithoutReplaceAll(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "f.txt")
+	os.WriteFile(f, []byte("foo foo"), 0o600)
+
+	args := `{"path":"` + f + `","old_string":"foo","new_string":"baz"}`
+	result, _ := dispatchTool(context.Background(), "edit_file", args, nil, nil, "", nil)
+	if !strings.Contains(result, "ambiguous") {
+		t.Errorf("expected ambiguous error, got %q", result)
+	}
+	if !strings.Contains(result, "replace_all") {
+		t.Errorf("expected hint about replace_all, got %q", result)
+	}
+}
+
+func TestDeleteFile(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "todelete.txt")
+	os.WriteFile(f, []byte("bye"), 0o600)
+
+	args := `{"path":"` + f + `"}`
+	result, _ := dispatchTool(context.Background(), "delete_file", args, nil, nil, "", nil)
+	if strings.Contains(result, "error") {
+		t.Fatalf("unexpected error: %q", result)
+	}
+	if _, err := os.Stat(f); !os.IsNotExist(err) {
+		t.Error("file should have been deleted")
+	}
+}
+
+func TestDeleteFile_Missing(t *testing.T) {
+	result, _ := dispatchTool(context.Background(), "delete_file", `{"path":"/nonexistent/file.txt"}`, nil, nil, "", nil)
+	if !strings.Contains(result, "error") && !strings.Contains(result, "no such file") {
+		t.Errorf("expected error for missing file, got %q", result)
+	}
+}
+
+func TestMoveFile(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.txt")
+	dst := filepath.Join(dir, "sub", "dst.txt")
+	os.WriteFile(src, []byte("content"), 0o600)
+
+	args := `{"source":"` + src + `","destination":"` + dst + `"}`
+	result, _ := dispatchTool(context.Background(), "move_file", args, nil, nil, "", nil)
+	if strings.Contains(result, "error") {
+		t.Fatalf("unexpected error: %q", result)
+	}
+	if _, err := os.Stat(src); !os.IsNotExist(err) {
+		t.Error("source file should be gone after move")
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("destination not found: %v", err)
+	}
+	if string(got) != "content" {
+		t.Errorf("expected content preserved, got %q", string(got))
+	}
+}
+
+func TestGetContextStats(t *testing.T) {
+	sess := &session.Session{}
+	sess.AddTurn(session.Turn{Role: session.RoleUser, Agent: session.AgentLocal, Content: "hello"})
+	sess.AddTurn(session.Turn{Role: session.RoleAssistant, Agent: session.AgentLocal, Content: "world"})
+
+	result, _ := dispatchTool(context.Background(), "get_context_stats", `{}`, sess, nil, "", nil)
+	if !strings.Contains(result, "local_turns=1") {
+		t.Errorf("expected local_turns=1, got %q", result)
+	}
+	if !strings.Contains(result, "total_history_turns=2") {
+		t.Errorf("expected total_history_turns=2, got %q", result)
+	}
+	if !strings.Contains(result, "total_history_chars=10") {
+		t.Errorf("expected total_history_chars=10 (hello+world), got %q", result)
+	}
+}
+
+func TestGetContextStats_NoSession(t *testing.T) {
+	result, _ := dispatchTool(context.Background(), "get_context_stats", `{}`, nil, nil, "", nil)
+	if !strings.Contains(result, "error") {
+		t.Errorf("expected error with nil session, got %q", result)
+	}
+}
+
+// --- AgentToolSchemas tests ---
+
+func TestAgentToolSchemas_Empty(t *testing.T) {
+	result := AgentToolSchemas(nil)
+	if result == nil {
+		t.Error("expected non-nil empty slice")
+	}
+	if len(result) != 0 {
+		t.Errorf("expected empty slice, got %d entries", len(result))
+	}
+}
+
+func TestAgentToolSchemas_SingleEntry(t *testing.T) {
+	entries := []config.AgentToolEntry{
+		{Agent: "my-agent", Description: "A helpful agent"},
+	}
+	result := AgentToolSchemas(entries)
+	if len(result) != 1 {
+		t.Fatalf("expected 1 schema, got %d", len(result))
+	}
+	schema := result[0]
+	if schema["type"] != "function" {
+		t.Errorf("expected type=function, got %v", schema["type"])
+	}
+	fn, ok := schema["function"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected function map, got %T", schema["function"])
+	}
+	if fn["name"] != "agent_my_agent" {
+		t.Errorf("expected agent_my_agent, got %v", fn["name"])
+	}
+	if fn["description"] != "A helpful agent" {
+		t.Errorf("expected description, got %v", fn["description"])
+	}
+	params, ok := fn["parameters"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected parameters map, got %T", fn["parameters"])
+	}
+	props, ok := params["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected properties map, got %T", params["properties"])
+	}
+	if _, hasRequest := props["request"]; !hasRequest {
+		t.Error("expected 'request' property in schema")
+	}
+	required, _ := params["required"].([]string)
+	if len(required) != 1 || required[0] != "request" {
+		t.Errorf("expected required=[request], got %v", required)
+	}
+}
+
+func TestSanitiseAgentToolName_Uppercase(t *testing.T) {
+	got := sanitiseAgentToolName("MyAgent")
+	if got != "agent_myagent" {
+		t.Errorf("expected agent_myagent, got %q", got)
+	}
+}
+
+func TestSanitiseAgentToolName_Hyphens(t *testing.T) {
+	got := sanitiseAgentToolName("my-agent")
+	if got != "agent_my_agent" {
+		t.Errorf("expected agent_my_agent, got %q", got)
+	}
+}
+
+func TestSanitiseAgentToolName_Spaces(t *testing.T) {
+	got := sanitiseAgentToolName("my agent")
+	if got != "agent_my_agent" {
+		t.Errorf("expected agent_my_agent, got %q", got)
+	}
+}
+
+// ── task tool schema tests ────────────────────────────────────────────────────
+
+// mockTaskStore is a minimal TaskStore implementation for use in tests.
+type mockTaskStore struct {
+	entries []TaskEntry
+}
+
+func (m *mockTaskStore) Create(title string, tags []string) (TaskEntry, error) {
+	e := TaskEntry{ID: "test01", Title: title, Status: "pending", Tags: tags}
+	m.entries = append(m.entries, e)
+	return e, nil
+}
+func (m *mockTaskStore) Update(id, status, title string) error { return nil }
+func (m *mockTaskStore) Complete(id string) error              { return nil }
+func (m *mockTaskStore) List(includeGlobal bool) ([]TaskEntry, error) {
+	return m.entries, nil
+}
+
+// TestTaskSchemas_FourDefinitions verifies that taskSchemas() returns exactly
+// four schemas with the correct name fields.
+func TestTaskSchemas_FourDefinitions(t *testing.T) {
+	s := taskSchemas()
+	if len(s) != 4 {
+		t.Fatalf("expected 4 task schemas, got %d", len(s))
+	}
+	want := []string{"create_task", "update_task", "list_tasks", "complete_task"}
+	for i, w := range want {
+		fn, _ := s[i]["function"].(map[string]any)
+		if fn == nil {
+			t.Fatalf("schema %d: missing 'function' key", i)
+		}
+		name, _ := fn["name"].(string)
+		if name != w {
+			t.Errorf("schema %d: name = %q, want %q", i, name, w)
+		}
+	}
+}
+
+// TestSchemas_IncludesTaskToolsWhenStorePresent verifies that schemas() includes
+// the 4 task tool definitions when a non-nil TaskStore is passed.
+func TestSchemas_IncludesTaskToolsWhenStorePresent(t *testing.T) {
+	ts := &mockTaskStore{}
+	all := schemas(nil, "", nil, nil, ts, nil)
+	taskNames := map[string]bool{
+		"create_task": false, "update_task": false,
+		"list_tasks": false, "complete_task": false,
+	}
+	for _, s := range all {
+		fn, _ := s["function"].(map[string]any)
+		if fn == nil {
+			continue
+		}
+		name, _ := fn["name"].(string)
+		if _, ok := taskNames[name]; ok {
+			taskNames[name] = true
+		}
+	}
+	for name, found := range taskNames {
+		if !found {
+			t.Errorf("schema for %q not found in schemas() output", name)
+		}
+	}
+}
+
+// TestSchemas_ExcludesTaskToolsWhenStoreNil verifies that schemas() does NOT
+// include task tools when TaskStore is nil.
+func TestSchemas_ExcludesTaskToolsWhenStoreNil(t *testing.T) {
+	all := schemas(nil, "", nil, nil, nil, nil)
+	for _, s := range all {
+		fn, _ := s["function"].(map[string]any)
+		if fn == nil {
+			continue
+		}
+		name, _ := fn["name"].(string)
+		switch name {
+		case "create_task", "update_task", "list_tasks", "complete_task":
+			t.Errorf("task tool %q found in schemas() when TaskStore is nil", name)
+		}
+	}
+}
+
+// ── TestSchemas — IncludedTools / ExcludedTools ───────────────────────────────
+
+// schemaNames extracts the tool function names from a schema slice.
+func schemaNames(schemas []map[string]any) []string {
+	var names []string
+	for _, s := range schemas {
+		if n := toolName(s); n != "" {
+			names = append(names, n)
+		}
+	}
+	return names
+}
+
+// containsName reports whether name appears in the slice.
+func containsName(names []string, name string) bool {
+	for _, n := range names {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+// TestSchemas_EmptyLimitsReturnsFullSet verifies that a nil limits pointer
+// produces the complete base tool set (no filtering applied).
+func TestSchemas_EmptyLimitsReturnsFullSet(t *testing.T) {
+	all := schemas(nil, "", nil, nil, nil, nil)
+	names := schemaNames(all)
+	// All well-known base tools must be present.
+	for _, want := range []string{"bash", "read_file", "write_file", "http_get", "http_request", "list_dir", "escalate"} {
+		if !containsName(names, want) {
+			t.Errorf("expected tool %q in full set, not found", want)
+		}
+	}
+}
+
+// TestSchemas_IncludedToolsFiltersCorrectly verifies that setting IncludedTools
+// keeps only the listed names in the base tool set.
+func TestSchemas_IncludedToolsFiltersCorrectly(t *testing.T) {
+	limits := &config.AgentLimits{
+		IncludedTools: []string{"bash", "read_file"},
+	}
+	all := schemas(nil, "", nil, nil, nil, limits)
+	names := schemaNames(all)
+
+	if !containsName(names, "bash") {
+		t.Error("expected bash in included result")
+	}
+	if !containsName(names, "read_file") {
+		t.Error("expected read_file in included result")
+	}
+	// Tools not in the whitelist must be absent.
+	for _, absent := range []string{"write_file", "http_get", "http_request", "list_dir"} {
+		if containsName(names, absent) {
+			t.Errorf("tool %q should be excluded by IncludedTools filter", absent)
+		}
+	}
+}
+
+// TestSchemas_ExcludedToolsRemovesNamedTools verifies that ExcludedTools removes
+// the listed tool names from the base set while keeping all others.
+func TestSchemas_ExcludedToolsRemovesNamedTools(t *testing.T) {
+	limits := &config.AgentLimits{
+		ExcludedTools: []string{"http_get", "http_request"},
+	}
+	all := schemas(nil, "", nil, nil, nil, limits)
+	names := schemaNames(all)
+
+	for _, absent := range []string{"http_get", "http_request"} {
+		if containsName(names, absent) {
+			t.Errorf("tool %q should have been removed by ExcludedTools", absent)
+		}
+	}
+	// Other tools should still be present.
+	for _, present := range []string{"bash", "read_file", "list_dir"} {
+		if !containsName(names, present) {
+			t.Errorf("tool %q should still be present after ExcludedTools filter", present)
+		}
+	}
+}
+
+// TestSchemas_BothSets_IncludedTakesPrecedenceThenExcluded verifies that when
+// both IncludedTools and ExcludedTools are set, the whitelist is applied first
+// and then the blacklist is applied to the result.
+func TestSchemas_BothSets_IncludedTakesPrecedenceThenExcluded(t *testing.T) {
+	limits := &config.AgentLimits{
+		IncludedTools: []string{"bash", "read_file", "http_get"},
+		ExcludedTools: []string{"http_get"},
+	}
+	all := schemas(nil, "", nil, nil, nil, limits)
+	names := schemaNames(all)
+
+	// bash and read_file: in whitelist, not in blacklist → present.
+	if !containsName(names, "bash") {
+		t.Error("expected bash to be present")
+	}
+	if !containsName(names, "read_file") {
+		t.Error("expected read_file to be present")
+	}
+	// http_get: in whitelist but also in blacklist → excluded.
+	if containsName(names, "http_get") {
+		t.Error("http_get should be excluded by ExcludedTools after IncludedTools")
+	}
+	// Tools not in the whitelist are excluded regardless.
+	if containsName(names, "write_file") {
+		t.Error("write_file was not in IncludedTools and should be absent")
+	}
+}

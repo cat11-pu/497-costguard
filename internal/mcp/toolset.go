@@ -1,0 +1,178 @@
+package mcp
+
+import (
+	"context"
+	"crypto/tls"
+	"net/http"
+	"strings"
+)
+
+// ToolSet manages a set of connected MCP clients and exposes them as a unified
+// tool interface to the local agent. It is safe for concurrent use.
+type ToolSet struct {
+	clients []*Client
+}
+
+// NewToolSet creates an unconnected ToolSet from a slice of clients.
+// Call Connect on each client (or use ConnectAll) before using schemas/dispatch.
+func NewToolSet(clients []*Client) *ToolSet {
+	return &ToolSet{clients: clients}
+}
+
+// ConnectAll connects all clients concurrently. Returns the first error
+// encountered; any clients that connected successfully are still usable.
+func (ts *ToolSet) ConnectAll(ctx context.Context) error {
+	type result struct{ err error }
+	ch := make(chan result, len(ts.clients))
+	for _, c := range ts.clients {
+		go func(cl *Client) {
+			ch <- result{cl.Connect(ctx)}
+		}(c)
+	}
+	var first error
+	for range ts.clients {
+		if r := <-ch; r.err != nil && first == nil {
+			first = r.err
+		}
+	}
+	return first
+}
+
+// Schemas returns OpenAI function-call schema entries for all tools across all
+// connected clients. Tool names are prefixed to avoid cross-server collisions.
+// Clients that were not ready at startup perform a lazy reconnect via ctx.
+func (ts *ToolSet) Schemas(ctx context.Context) []map[string]any {
+	var result []map[string]any
+	for _, c := range ts.clients {
+		result = append(result, c.Schemas(ctx)...)
+	}
+	return result
+}
+
+// Dispatch routes a tool call (by prefixed name) to the appropriate MCP client
+// and returns the text result plus any images the tool returned (as data:
+// URIs, for the caller to attach to a follow-up vision message). Returns
+// ("", nil, false) when the name doesn't match any known MCP tool, so the
+// caller can fall through to built-in tools.
+//
+// When multiple configured server names share a prefix (e.g. "cloudflare" and
+// "cloudflare-bindings"), a tool name can match more than one client's prefix
+// — "mcp_cloudflare_bindings_workers_list" literally starts with the shorter
+// server's "mcp_cloudflare_" prefix too. The longest matching prefix (i.e. the
+// most specific server name) always wins, so the shorter server never steals
+// calls meant for a longer, more specific sibling.
+func (ts *ToolSet) Dispatch(ctx context.Context, toolName, argsJSON string) (string, []string, bool) {
+	var best *Client
+	var bestOrig string
+	bestPrefixLen := -1
+	for _, c := range ts.clients {
+		orig, ok := c.OriginalToolName(toolName)
+		if !ok {
+			continue
+		}
+		if prefixLen := len(toolName) - len(orig); prefixLen > bestPrefixLen {
+			best, bestOrig, bestPrefixLen = c, orig, prefixLen
+		}
+	}
+	if best == nil {
+		return "", nil, false
+	}
+	res, err := best.Call(ctx, bestOrig, argsJSON)
+	if err != nil {
+		return `{"error":"` + strings.ReplaceAll(err.Error(), `"`, `'`) + `"}`, nil, true
+	}
+	text := res.Text()
+	images := res.Images()
+	if res.IsError {
+		return `{"error":` + jsonQuote(text) + `}`, nil, true
+	}
+	if text == "" && len(images) > 0 {
+		text = "(image content — see attached image)"
+	}
+	return `{"output":` + jsonQuote(text) + `}`, images, true
+}
+
+// Close closes all client sessions.
+func (ts *ToolSet) Close(ctx context.Context) {
+	for _, c := range ts.clients {
+		c.Close(ctx)
+	}
+}
+
+// Len returns the number of clients in the set.
+func (ts *ToolSet) Len() int { return len(ts.clients) }
+
+// Clients returns the underlying client slice (for status display / /mcp list).
+func (ts *ToolSet) Clients() []*Client { return ts.clients }
+
+// ServerStatus returns the runtime ConnectionStatus of the named server, or
+// StatusDisconnected when no client with that name exists in this set.
+func (ts *ToolSet) ServerStatus(serverName string) ConnectionStatus {
+	for _, c := range ts.clients {
+		if strings.EqualFold(c.cfg.Name, serverName) {
+			return c.Status()
+		}
+	}
+	return StatusDisconnected
+}
+
+// ResetServer clears the dead flag on the named client so the next tool use
+// will attempt a lazy reconnect. Returns false when the server is not found.
+func (ts *ToolSet) ResetServer(serverName string) bool {
+	for _, c := range ts.clients {
+		if strings.EqualFold(c.cfg.Name, serverName) {
+			c.Reset()
+			return true
+		}
+	}
+	return false
+}
+
+// ResetAll clears the dead flag on every client in the set.
+func (ts *ToolSet) ResetAll() {
+	for _, c := range ts.clients {
+		c.Reset()
+	}
+}
+
+// jsonQuote returns a JSON-encoded string literal for s.
+func jsonQuote(s string) string {
+	b, _ := jsonMarshalString(s)
+	return string(b)
+}
+
+func jsonMarshalString(s string) ([]byte, error) {
+	var sb strings.Builder
+	sb.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '"':
+			sb.WriteString(`\"`)
+		case '\\':
+			sb.WriteString(`\\`)
+		case '\n':
+			sb.WriteString(`\n`)
+		case '\r':
+			sb.WriteString(`\r`)
+		case '\t':
+			sb.WriteString(`\t`)
+		default:
+			if r < 0x20 {
+				sb.WriteString(`\u00`)
+				sb.WriteByte("0123456789abcdef"[r>>4])
+				sb.WriteByte("0123456789abcdef"[r&0xf])
+			} else {
+				sb.WriteRune(r)
+			}
+		}
+	}
+	sb.WriteByte('"')
+	return []byte(sb.String()), nil
+}
+
+// insecureTLSTransport returns an HTTP transport with TLS verification disabled.
+func insecureTLSTransport() http.RoundTripper {
+	return &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+	}
+}

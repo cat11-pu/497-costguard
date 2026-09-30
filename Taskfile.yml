@@ -1,0 +1,141 @@
+---
+version: '3'
+
+vars:
+  BIN: ~/.local/bin/milk
+  CMD: ./cmd/milk
+  VERSION:
+    sh: git describe --tags --always --dirty 2>/dev/null || echo dev
+  COMMIT:
+    sh: git rev-parse --short HEAD 2>/dev/null || echo none
+  DATE:
+    sh: date -u +%Y-%m-%dT%H:%M:%SZ
+  LDFLAGS: -X main.version={{.VERSION}} -X main.commit={{.COMMIT}} -X main.date={{.DATE}}
+
+tasks:
+  default:
+    cmds:
+      - task -l
+    silent: true
+
+  fmt:
+    desc: Format source code
+    cmds:
+      - find . -name '*.go' | grep -v vendor | xargs gofmt -s -w
+
+  build:
+    desc: Compile and install binary to DEST (default {{.BIN}})
+    vars:
+      DEST: '{{default .BIN .DEST}}'
+    cmds:
+      - go build -ldflags "{{.LDFLAGS}}" -o {{.DEST}} {{.CMD}}
+    deps:
+      - fmt
+
+  build:local:
+    desc: Compile binary into current directory
+    cmds:
+      - task: build
+        vars:
+          DEST: ./milk
+
+  test:
+    desc: Run all tests
+    cmds:
+      - go test ./...
+    deps:
+      - fmt
+
+  run:
+    desc: Build and start milk in interactive mode
+    cmds:
+      - '{{.BIN}}'
+    deps:
+      - build
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - go vet ./...
+
+  install-scripts:
+    desc: Install subprocess adapter scripts (milk-smolagent) to ~/.local/bin
+    vars:
+      SCRIPTS_DEST: ~/.local/bin
+    cmds:
+      - mkdir -p {{.SCRIPTS_DEST}}
+      - cp scripts/milk-smolagent {{.SCRIPTS_DEST}}/milk-smolagent
+      - chmod +x {{.SCRIPTS_DEST}}/milk-smolagent
+      - echo "installed milk-smolagent to {{.SCRIPTS_DEST}}"
+
+  demo:
+    desc: Record the TUI demo gif (requires vhs)
+    cmds:
+      - vhs demo/demo.tape
+    deps:
+      - build
+
+  build:mock:
+    desc: Compile milk-mock binary into current directory
+    cmds:
+      - go build -o ./milk-mock ./cmd/milk-mock
+    deps:
+      - fmt
+
+  mock:server:
+    desc: Start the milk-mock OpenAI-compatible SSE server (name=test, port=19999)
+    cmds:
+      - ./milk-mock server --name test --port 19999
+    deps:
+      - build:mock
+
+  mock:claude:
+    desc: Show usage for milk-mock claude (drop-in claude CLI mock)
+    cmds:
+      - ./milk-mock claude --help
+    deps:
+      - build:mock
+
+  test:integration:
+    desc: Run integration tests (requires milk-mock binary in current directory)
+    cmds:
+      - go test -tags integration ./internal/mockrecorder/
+    deps:
+      - build:mock
+
+  models-dev:update:
+    desc: Refresh the embedded models.dev catalog snapshot (internal/modelsdev/snapshot.json)
+    cmds:
+      - scripts/update-models-dev-snapshot.sh
+
+  ci:
+    desc: models-dev:update + fmt + vet + test + build
+    cmds:
+      - task: models-dev:update
+      - task: fmt
+      - task: vet
+      - task: test
+      - task: build
+
+  site:build:
+    desc: Build the milk website with MkDocs (creates website/.venv if missing)
+    dir: website
+    cmds:
+      - test -d .venv || python3 -m venv .venv
+      - .venv/bin/pip install -q -r requirements.txt
+      - .venv/bin/mkdocs build
+
+  site:serve:
+    desc: Serve the milk website locally with live-reload
+    dir: website
+    cmds:
+      - .venv/bin/mkdocs serve
+    deps:
+      - site:build
+
+  site:deploy:
+    desc: Deploy website to FTP (requires FTP_PASS env var)
+    cmds:
+      - python3 scripts/deploy-ftp.py
+    deps:
+      - site:build

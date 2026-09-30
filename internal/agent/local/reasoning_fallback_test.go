@@ -1,0 +1,306 @@
+package local
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	"github.com/scoutme/milk/internal/session"
+)
+
+// TestRun_ReasoningOnlyCompletion_FallsBackToReasoningText verifies that when
+// the model streams only reasoning_content (no content, no tool calls) before
+// the stream ends cleanly, Run() does not terminate the turn with an empty
+// assistant message. Instead it falls back to the reasoning text so the turn
+// persists to session history instead of vanishing (see dispatch.go's
+// `res.Text != ""` guard, which would otherwise silently drop it).
+func TestRun_ReasoningOnlyCompletion_FallsBackToReasoningText(t *testing.T) {
+	const reasoning = "Now let me update the exchange_list.php template."
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":%q}}]}\n\n", reasoning)
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	agent := New(srv.URL, "test-model")
+	sess := &session.Session{}
+	var out strings.Builder
+
+	history, err := agent.Run(context.Background(), nil, "hi", &out, sess, nil)
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if len(history) == 0 {
+		t.Fatal("expected non-empty updated history")
+	}
+	last := history[len(history)-1]
+	if last.Role != "assistant" {
+		t.Fatalf("expected last message role=assistant, got %q", last.Role)
+	}
+	if last.Content != reasoning {
+		t.Errorf("expected assistant content to fall back to reasoning text %q, got %q", reasoning, last.Content)
+	}
+}
+
+// TestRun_ReasoningOnlyCompletion_RendersAsVisibleContentAndSignalsPromotion
+// verifies the fix for a real bug: when a completion streams its whole
+// answer through reasoning_content with an empty content channel, the
+// promoted text must actually be written to `out` (so it renders in the
+// transcript instead of leaving the chat view empty), and
+// onReasoningPromoted must fire so the caller can discard the reasoning it
+// already accumulated live for this turn instead of persisting a duplicate
+// of the answer as both Content and Thinking.
+func TestRun_ReasoningOnlyCompletion_RendersAsVisibleContentAndSignalsPromotion(t *testing.T) {
+	const reasoning = "Want me to proceed with setting up a Cloudflare Agent project in your workspace?"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":%q}}]}\n\n", reasoning)
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	var promoted atomic.Bool
+	agent := New(srv.URL, "test-model").WithOnReasoningPromoted(func() { promoted.Store(true) })
+	sess := &session.Session{}
+	var out strings.Builder
+
+	history, err := agent.Run(context.Background(), nil, "fetch cloudflare setup", &out, sess, nil)
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	last := history[len(history)-1]
+	if last.Content != reasoning {
+		t.Fatalf("expected assistant content to fall back to reasoning text %q, got %q", reasoning, last.Content)
+	}
+	if !strings.Contains(out.String(), reasoning) {
+		t.Errorf("expected promoted reasoning text to be written to out (visible transcript), got %q", out.String())
+	}
+	if !promoted.Load() {
+		t.Error("expected onReasoningPromoted callback to fire")
+	}
+}
+
+func TestRun_NativeToolCallWithNullContinuationFields_ContinuesTurn(t *testing.T) {
+	var calls atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if calls.Add(1) == 1 {
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"reasoning_content":"Let me try another approach."},"finish_reason":null}]}`+"\n\n")
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"arguments":"","name":"bash"},"type":"function"}]},"finish_reason":null}]}`+"\n\n")
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":null,"function":{"arguments":"{\"command\": ","name":null},"type":"function"}]},"finish_reason":null}]}`+"\n\n")
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":null,"function":{"arguments":"\"printf milk-tool-ok\"","name":null},"type":"function"}]},"finish_reason":null}]}`+"\n\n")
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":null,"function":{"arguments":"}","name":null},"type":"function"}]},"finish_reason":null}]}`+"\n\n")
+			fmt.Fprint(w, `data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`+"\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			return
+		}
+		fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"finished after tool"},"finish_reason":"stop"}]}`+"\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	agent := New(srv.URL, "test-model").WithSkipPermissions(true)
+	sess := &session.Session{}
+	var out strings.Builder
+
+	history, err := agent.Run(context.Background(), nil, "try again", &out, sess, nil)
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("expected turn to continue after tool dispatch, got %d completion request(s)", calls.Load())
+	}
+	if history[len(history)-1].Content != "finished after tool" {
+		t.Fatalf("expected final assistant response after tool result, got %#v", history[len(history)-1])
+	}
+	var sawToolResult bool
+	for _, msg := range history {
+		if msg.Role == "tool" && strings.Contains(msg.Content, "milk-tool-ok") {
+			sawToolResult = true
+		}
+	}
+	if !sawToolResult {
+		t.Fatalf("expected bash tool result in history, got %#v", history)
+	}
+}
+
+// TestRun_ToolCallsThenEmptyCompletion_PreservesToolTrail verifies the
+// reported scenario: a turn makes real tool calls (edits, etc.) across
+// several loop iterations, then the final completion comes back empty
+// (reasoning-only, no content, no tool calls). The fallback must not just
+// carry the trailing reasoning — it must also preserve a record of what the
+// turn actually did (the tool calls and their results), since that is the
+// "main content" a later "resume" turn needs, not just the last thought.
+func TestRun_ToolCallsThenEmptyCompletion_PreservesToolTrail(t *testing.T) {
+	const reasoning = "Now let me update the exchange_list.php template."
+	var calls atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if calls.Add(1) == 1 {
+			// First completion: a native tool call (e.g. an edit).
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"tc1","function":{"name":"read_file","arguments":"{\"path\":\"/nonexistent/style.css\"}"}}]}}]}`+"\n\n")
+			fmt.Fprint(w, `data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`+"\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			return
+		}
+		// Second completion: reasoning-only, empty content, no tool calls.
+		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":%q}}]}\n\n", reasoning)
+		fmt.Fprint(w, `data: {"choices":[{"delta":{},"finish_reason":"stop"}]}`+"\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	agent := New(srv.URL, "test-model")
+	sess := &session.Session{}
+	var out strings.Builder
+
+	history, err := agent.Run(context.Background(), nil, "resume", &out, sess, nil)
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	last := history[len(history)-1]
+	if last.Role != "assistant" {
+		t.Fatalf("expected last message role=assistant, got %q", last.Role)
+	}
+	if !strings.Contains(last.Content, "read_file") {
+		t.Errorf("expected fallback content to mention the tool call made this turn, got %q", last.Content)
+	}
+	if !strings.Contains(last.Content, reasoning) {
+		t.Errorf("expected fallback content to also keep the reasoning text, got %q", last.Content)
+	}
+}
+
+// TestRun_MaxToolIterationsExceeded_PreservesToolTrail verifies that when the
+// model keeps making (distinct) tool calls every iteration and never emits a
+// final response, exhausting MaxToolIterations does not end the turn in a
+// bare error. Before this fix, Run returned only an error and the caller
+// (cmd/milk/runner.go) discards updatedHistory whenever err != nil, so the
+// whole tool trail — not just the summary — was silently lost.
+func TestRun_MaxToolIterationsExceeded_PreservesToolTrail(t *testing.T) {
+	var calls atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		n := calls.Add(1)
+		fmt.Fprintf(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"tc%d","function":{"name":"read_file","arguments":"{\"path\":\"/nonexistent/file%d.css\"}"}}]}}]}`+"\n\n", n, n)
+		fmt.Fprint(w, `data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`+"\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	agent := New(srv.URL, "test-model").WithMemConfig(MemConfig{MaxToolIterations: 3})
+	sess := &session.Session{}
+	var out strings.Builder
+
+	history, err := agent.Run(context.Background(), nil, "keep going", &out, sess, nil)
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	last := history[len(history)-1]
+	if last.Role != "assistant" {
+		t.Fatalf("expected last message role=assistant, got %q", last.Role)
+	}
+	if !strings.Contains(last.Content, "read_file") {
+		t.Errorf("expected fallback content to mention the tool calls made this turn, got %q", last.Content)
+	}
+	if calls.Load() != 3 {
+		t.Errorf("expected exactly MaxToolIterations (3) completion calls, got %d", calls.Load())
+	}
+}
+
+// TestRun_MaxToolIterationsExceeded_WorkflowRoleSkipsForcedSummary verifies
+// that workflow-step executors are excluded from the forced-summary behavior
+// (like the other intra-turn loop detectors, gated by a.workflowRole): the
+// workflow interpreter handles recovery for these at a higher level, so
+// tools must stay enabled through the last iteration and the mechanical
+// tool-trail dump remains the only fallback.
+func TestRun_MaxToolIterationsExceeded_WorkflowRoleSkipsForcedSummary(t *testing.T) {
+	var calls atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), `"tools"`) {
+			t.Errorf("expected tools to remain enabled for a workflow-role agent, even on the last iteration")
+		}
+		n := calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintf(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"tc%d","function":{"name":"read_file","arguments":"{\"path\":\"/nonexistent/file%d.css\"}"}}]}}]}`+"\n\n", n, n)
+		fmt.Fprint(w, `data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`+"\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	agent := New(srv.URL, "test-model").WithMemConfig(MemConfig{MaxToolIterations: 3})
+	agent.workflowRole = true
+	sess := &session.Session{}
+	var out strings.Builder
+
+	history, err := agent.Run(context.Background(), nil, "keep going", &out, sess, nil)
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	last := history[len(history)-1]
+	if !strings.Contains(last.Content, "turn ended without a final summary") {
+		t.Errorf("expected the mechanical tool-trail fallback for a workflow-role agent, got %q", last.Content)
+	}
+	if calls.Load() != 3 {
+		t.Errorf("expected exactly MaxToolIterations (3) completion calls, got %d", calls.Load())
+	}
+}
+
+// TestRun_MaxToolIterationsExceeded_ForcesModelSummary verifies that on the
+// last allowed iteration, tools are dropped from the request and the model
+// is given the chance to produce its own closing summary instead of the turn
+// always falling through to the mechanical tool-trail dump. The fake server
+// inspects the request body: while "tools" is present it keeps calling
+// read_file (simulating a model that hasn't converged); once "tools" is
+// absent (the forced-summary call) it returns a plain text final answer.
+func TestRun_MaxToolIterationsExceeded_ForcesModelSummary(t *testing.T) {
+	var calls atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		n := calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if strings.Contains(string(body), `"tools"`) {
+			fmt.Fprintf(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"tc%d","function":{"name":"read_file","arguments":"{\"path\":\"/nonexistent/file%d.css\"}"}}]}}]}`+"\n\n", n, n)
+			fmt.Fprint(w, `data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`+"\n\n")
+		} else {
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"Done: read some files. Remaining: none."},"finish_reason":"stop"}]}`+"\n\n")
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	agent := New(srv.URL, "test-model").WithMemConfig(MemConfig{MaxToolIterations: 3})
+	sess := &session.Session{}
+	var out strings.Builder
+
+	history, err := agent.Run(context.Background(), nil, "keep going", &out, sess, nil)
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	last := history[len(history)-1]
+	if last.Role != "assistant" {
+		t.Fatalf("expected last message role=assistant, got %q", last.Role)
+	}
+	if !strings.Contains(last.Content, "Done: read some files") {
+		t.Errorf("expected the model's own forced summary, got %q", last.Content)
+	}
+	if strings.Contains(last.Content, "turn ended without a final summary") {
+		t.Errorf("should not fall through to the mechanical tool-trail dump when the model provides a real summary, got %q", last.Content)
+	}
+	if calls.Load() != 3 {
+		t.Errorf("expected exactly MaxToolIterations (3) completion calls, got %d", calls.Load())
+	}
+}

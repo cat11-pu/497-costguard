@@ -1,0 +1,476 @@
+package main
+
+import (
+	"fmt"
+	"math"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/charmbracelet/x/ansi"
+	rw "github.com/mattn/go-runewidth"
+
+	"github.com/scoutme/milk/internal/config"
+	"github.com/scoutme/milk/internal/session"
+)
+
+func (m *model) headerBar() string {
+	frame := 8 // static peak (bright gold) when idle
+	if m.busy {
+		frame = m.spinnerFrame
+	}
+	logo := headerLogo(frame)
+	tagline := dim("switch models, not context.")
+	taglinePlain := "switch models, not context."
+
+	sessID := m.st.sess.ID
+	if len(sessID) > 8 {
+		sessID = sessID[:8]
+	}
+	var totalPrompt, totalCompletion, totalCacheRead, totalCacheCreation int64
+	for _, u := range m.st.sess.TokensSnapshot() {
+		totalPrompt += u.Prompt
+		totalCompletion += u.Completion
+		totalCacheRead += u.CacheRead
+		totalCacheCreation += u.CacheCreation
+	}
+	sessLabel := fmt.Sprintf("sess:%s (total:↑%s↓%s)", sessID, formatTokenCount(totalPrompt), formatTokenCount(totalCompletion))
+	if cacheActivity := totalCacheRead + totalCacheCreation; cacheActivity > 0 {
+		// Denominator is total input tokens (fresh prompt + cacheRead +
+		// cacheCreation), not just cacheRead+cacheCreation — otherwise a provider
+		// that never reports cacheCreation (e.g. OpenAI-style automatic caching)
+		// would always show 100% whenever cacheRead > 0, regardless of how much
+		// genuinely-fresh input there was.
+		hitPct := int(100 * float64(totalCacheRead) / float64(totalPrompt+cacheActivity))
+		sessLabel += fmt.Sprintf(" cache:%d%%", hitPct)
+	}
+	const repoURL = "github.com/scoutme/milk"
+	rightFull := dim(repoURL + "  " + sessLabel + "  /help")
+	rightFulPlain := repoURL + "  " + sessLabel + "  /help"
+	rightShort := dim(sessLabel + "  /help")
+	rightShortPlain := sessLabel + "  /help"
+
+	logoPlain := stripANSI(logo)
+	available := m.width - 2
+	rightPart, rightPlain := rightFull, rightFulPlain
+	if available < len(logoPlain)+2+len(taglinePlain)+2+len(rightFulPlain) {
+		rightPart, rightPlain = rightShort, rightShortPlain
+	}
+	left := " " + logo + "  " + tagline
+	leftPlain := " " + logoPlain + "  " + taglinePlain
+	gap := max(available-len(leftPlain)-len(rightPlain), 1)
+	bar := left + strings.Repeat(" ", gap) + rightPart + " "
+	if isTTY {
+		return styleHeaderBar.Width(m.width).Render(bar)
+	}
+	return bar
+}
+
+// statusBar renders the one-line status bar.
+func (m *model) statusBar() string {
+	tokenStr := m.statusTokens()
+	// When a permission prompt is active, avoid dim() — its ANSI reset (\033[0m)
+	// kills the yellow background that styleStatusBarPerm sets.
+	isPerm := m.pendingPerm != nil
+	rolePart := "role:" + sessionRole(m.st.sess.State)
+	agentPart := "agent:" + m.statusAgent()
+	if !isPerm {
+		rolePart = dim(rolePart)
+		agentPart = dim("agent:") + m.statusAgent()
+	}
+	left := fmt.Sprintf(" %s  %s%s", rolePart, agentPart, tokenStr)
+	right := ""
+	if m.updateInstalling {
+		pct := ""
+		if m.updateTotal > 0 {
+			pct = fmt.Sprintf(" %d%%", 100*m.updateProgress/m.updateTotal)
+		}
+		right += yellow("⬆ updating" + pct + " ")
+	} else if m.pendingUpdate != nil {
+		right += yellow("⬆ " + m.pendingUpdate.Tag + " available — /update install ")
+	}
+	if isPerm {
+		right += m.statusCwd() + " "
+	} else {
+		right += dim(m.statusCwd() + " ")
+	}
+	if m.credRefreshing {
+		left += dim(" [refreshing " + m.credLabel + " credentials…]")
+	} else if m.credStatus != "" {
+		if m.credOK {
+			left += dim(" [" + m.credLabel + " creds: " + m.credStatus + "]")
+		} else {
+			left += yellow(" [" + m.credLabel + " creds failed: " + m.credStatus + "]")
+		}
+	}
+	if n := len(m.pendingAttachments); n > 0 {
+		left += dim(fmt.Sprintf(" [%d attached]", n))
+	}
+	if m.agents.backgroundMgr != nil {
+		if n := m.agents.backgroundMgr.ActiveCount(); n > 0 {
+			left += dim(" [⚙ " + pluralize(n, "background agent") + " running]")
+		}
+	}
+	if m.quitPending {
+		left += yellow(" [press ctrl+c again to exit]")
+	} else if m.loopInterrupt {
+		left += yellow(" [⚠ loop — auto-interrupted]")
+	} else if m.loopWarning != "" {
+		left += yellow(" [" + m.loopWarning + "]")
+	} else if m.busyHint != "" {
+		left += yellow(" [" + m.busyHint + "]")
+	} else if m.copyFeedback != "" {
+		left += green(" [" + m.copyFeedback + "]")
+	} else if m.taSelAnchor >= 0 && m.taSelEnd >= 0 && m.taSelAnchor != m.taSelEnd {
+		n := len([]rune(m.taSelText()))
+		left += yellow(fmt.Sprintf(" [%d chars selected — ctrl+c copy · ctrl+x cut · del delete · type to replace]", n))
+	} else if m.selAnchorLine >= 0 && m.selDragging {
+		var selStatus string
+		if m.selText != "" {
+			selStatus = yellow(fmt.Sprintf(" [%d chars — ctrl+c / right-click to copy]", len([]rune(m.selText))))
+		} else {
+			selStatus = yellow(fmt.Sprintf(" [selecting: line %d col %d — release to end]", m.selAnchorLine+1, m.selAnchorCol+1))
+		}
+		left += selStatus
+	} else if m.selAnchorLine >= 0 {
+		hint := " [transcript selection — shift/ctrl+arrows or ctrl+click to extend · ctrl+c / right-click to copy · esc to clear]"
+		if m.selText != "" {
+			hint = fmt.Sprintf(" [%d chars selected — shift/ctrl+arrows or ctrl+click to extend · ctrl+c / right-click to copy · esc to clear]", len([]rune(m.selText)))
+		}
+		left += yellow(hint)
+	} else if m.panelSelAnchorLine >= 0 && m.panelSelDragging {
+		var selStatus string
+		if m.panelSelText != "" {
+			selStatus = yellow(fmt.Sprintf(" [%d chars — ctrl+c / right-click to copy]", len([]rune(m.panelSelText))))
+		} else {
+			selStatus = yellow(" [selecting panel text — release to end]")
+		}
+		left += selStatus
+	} else if m.panelSelAnchorLine >= 0 {
+		hint := " [panel selection — ctrl+click to extend · ctrl+c / right-click to copy · esc to clear]"
+		if m.panelSelText != "" {
+			hint = fmt.Sprintf(" [%d chars selected (panel) — ctrl+click to extend · ctrl+c / right-click to copy · esc to clear]", len([]rune(m.panelSelText)))
+		}
+		left += yellow(hint)
+	}
+	// Truncate right (cwd) if it alone exceeds terminal width
+	{
+		maxRight := m.width - 2 // leave at least 1 char for left + gap
+		if maxRight < 1 {
+			maxRight = 1
+		}
+		plainRight := ansi.Strip(right)
+		if rw.StringWidth(plainRight) > maxRight {
+			runes := []rune(plainRight)
+			w := 0
+			start := len(runes)
+			for i := len(runes) - 1; i >= 0; i-- {
+				cw := rw.RuneWidth(runes[i])
+				if w+cw > maxRight-1 { // -1 for the "…" prefix
+					break
+				}
+				w += cw
+				start = i
+			}
+			right = dim("…" + string(runes[start:]) + " ")
+		}
+	}
+	rightWidth := rw.StringWidth(ansi.Strip(right))
+	leftWidth := rw.StringWidth(ansi.Strip(left))
+	maxLeftWidth := m.width - rightWidth - 1
+	if maxLeftWidth < 1 {
+		maxLeftWidth = 1
+	}
+	if leftWidth > maxLeftWidth {
+		// truncate left to maxLeftWidth visual chars, preserving dim styling
+		plain := ansi.Strip(left)
+		runes := []rune(plain)
+		w := 0
+		cut := 0
+		for i, r := range runes {
+			cw := rw.RuneWidth(r)
+			if w+cw > maxLeftWidth {
+				break
+			}
+			w += cw
+			cut = i + 1
+		}
+		left = dim(string(runes[:cut]))
+		leftWidth = w
+	}
+	gap := max(m.width-leftWidth-rightWidth, 1)
+	bar := left + strings.Repeat(" ", gap) + right
+	if isTTY {
+		if m.pendingPerm != nil {
+			return styleStatusBarPerm.Width(m.width).MaxWidth(m.width).Render(bar)
+		}
+		return styleStatusBar.Width(m.width).MaxWidth(m.width).Render(bar)
+	}
+	return bar
+}
+
+func (m *model) statusAgent() string {
+	if m.ptyPane != nil {
+		frame := yellow(bold(spinnerFrames[m.spinnerFrame%len(spinnerFrames)]))
+		cmd := m.ptyPane.shellCmd
+		if len(cmd) > 40 {
+			cmd = cmd[:37] + "…"
+		}
+		return frame + " " + dim("[sh: "+cmd+"]") + "  " + dim("keys forwarded · Ctrl+C = ^C · Ctrl+D = EOF")
+	}
+	if m.searching {
+		label := "reverse-i-search"
+		if m.searchForward {
+			label = "forward-i-search"
+		}
+		return dim("(" + label + ")`" + m.searchQuery.String() + "'")
+	}
+	agent := dim(agentLabel(m.st))
+	if m.pendingPerm != nil {
+		lbl := m.pendingPerm.label
+		if lbl == "" {
+			lbl = "[allow?]"
+		}
+		// Don't use dim() here — its ANSI reset kills the yellow background
+		// that styleStatusBarPerm sets.
+		return "? " + agentLabel(m.st) + " " + lbl
+	}
+	if m.attached != nil {
+		// The attach view's own "── attached: … ──" header line (attach.go)
+		// scrolls out of sight with the rest of the buffer — this status-bar
+		// copy is the one that stays visible regardless of scroll position.
+		// Below pendingPerm (above): a permission prompt is still the more
+		// urgent thing to surface if both are somehow true at once.
+		label := m.attached.label
+		if len(label) > 40 {
+			label = label[:37] + "…"
+		}
+		return dim("[attached: "+label+"]") + "  " + yellow("[Esc to detach]")
+	}
+	if m.busy {
+		frame := yellow(bold(spinnerFrames[m.spinnerFrame%len(spinnerFrames)]))
+		pulsed := pulse(agentLabel(m.st), m.spinnerFrame)
+		if m.activeToolUse != "" {
+			return frame + " " + pulsed + dim(" ["+m.activeToolUse+"]")
+		}
+		return frame + " " + pulsed
+	}
+	return agent
+}
+
+// statusTokens returns the token counter fragment for the status bar.
+// While busy: shows live streamed char count as a proxy for in-progress output.
+// While idle: "in:X out:Y  last in:X out:Y" — session totals + last turn real tokens.
+func (m *model) statusTokens() string {
+	role := m.activeTokenRole()
+
+	if !m.busy {
+		m.lastTokenRole = role
+	}
+
+	var prompt, completion int64
+	switch role {
+	case "escalation":
+		prompt, completion = m.escalationPrompt, m.escalationComp
+	default:
+		prompt, completion = m.primaryPrompt, m.primaryCompletion
+	}
+
+	lastPrompt := m.lastTurnPrompt[role]
+	lastCompletion := m.lastTurnCompletion[role]
+
+	var parts []string
+	parts = append(parts, fmt.Sprintf("↑%s↓%s", formatTokenCount(prompt), formatTokenCount(completion)))
+	if m.busy {
+		estimatedOut := int64(math.Round(float64(m.currentTurnChars) * 0.25))
+		estimatedIn := int64(math.Round(float64(m.currentTurnInputChars) * 0.25))
+		parts = append(parts, fmt.Sprintf("↑~%s↓~%s", formatTokenCount(estimatedIn), formatTokenCount(estimatedOut)))
+	} else if lastPrompt+lastCompletion > 0 {
+		parts = append(parts, fmt.Sprintf("(last:↑%s↓%s)", formatTokenCount(lastPrompt), formatTokenCount(lastCompletion)))
+	}
+	if role == "escalation" {
+		// Same fresh-prompt-inclusive denominator as headerBar's cache:NN% — see
+		// the comment there for why cacheRead+cacheCreation alone is wrong.
+		if cacheActivity := m.escalationCacheRead + m.escalationCacheCreation; cacheActivity > 0 {
+			hitPct := int(100 * float64(m.escalationCacheRead) / float64(prompt+cacheActivity))
+			if m.escalationCacheCreation > 0 {
+				parts = append(parts, fmt.Sprintf("cache:%s/%s(%d%%)",
+					formatTokenCount(m.escalationCacheRead),
+					formatTokenCount(m.escalationCacheCreation),
+					hitPct))
+			} else {
+				parts = append(parts, fmt.Sprintf("cache:%s(%d%%)",
+					formatTokenCount(m.escalationCacheRead),
+					hitPct))
+			}
+		}
+	}
+	// ctx:x/y should reflect the actual conversation size (what the model
+	// sees in a single request), not the cumulative session total which grows
+	// without bound across turns. When idle, use the last turn's input tokens
+	// (prompt + cache) as the best available estimate; when busy,
+	// statusContextPressure already switches to the live char-based estimate.
+	perTurnInput := lastPrompt + m.lastTurnCacheRead[role] + m.lastTurnCacheCreate[role]
+	if ctxFragment := m.statusContextPressure(role, perTurnInput); ctxFragment != "" {
+		// Appended last and deliberately NOT run through the outer dim() below:
+		// dim/yellow/red all end with the same ANSI reset, so a colored fragment
+		// nested inside dim's string would have its own reset kill the dim state
+		// for anything after it — safe only because nothing follows this in the
+		// join. Kept as its own trailing, separately-composed segment instead of
+		// relying on that ordering staying true forever.
+		return "  " + dim(strings.Join(parts, "  ")) + "  " + ctxFragment
+	}
+	return "  " + dim(strings.Join(parts, "  "))
+}
+
+// contextPressureHighPct/CriticalPct are the thresholds at which the
+// ctx:x/y status-bar fragment shifts from dim (normal) to yellow (high) to
+// red (critical) — mirroring the loop-detection warning's use of yellow for
+// "pay attention" state, extended with a red tier since context exhaustion
+// (unlike a loop) has a hard failure mode once the trim budget can no longer
+// fit the system prompt and tools. Thresholds are evaluated against the exact
+// percentage even though the displayed label always shows raw counts, not a
+// rounded percentage.
+const (
+	contextPressureHighPct     = 75
+	contextPressureCriticalPct = 90
+)
+
+// statusContextPressure returns a "ctx:x/y" fragment (or bare "ctx:x" when no
+// context window is configured) showing how much of the active agent's
+// context window the current conversation is using — live-estimated while busy
+// (mirrors the ↑~/↓~ estimate above it), the last turn's real input tokens
+// while idle. The numerator includes cached tokens (cacheRead +
+// cacheCreation) since they occupy context window space.
+//
+// Always shows the "x/y" pair rather than switching between a percentage and
+// an absolute count depending on whether the percentage would round to a
+// meaningful number — a single format that stays informative at any window
+// size (a 1M-token window makes a rounded percentage meaningless below ~10k
+// tokens, but "77/1.0M" is still legible) is simpler than two formats that
+// look identical to the ↑/↓ token counts already on the line in the case
+// they were meant to complement. Returns "" only when there's no usable
+// numerator yet.
+func (m *model) statusContextPressure(role string, promptTokens int64) string {
+	var ac config.AgentConfig
+	if role == "escalation" {
+		ac = m.st.cfg.EscalationAgentConfig()
+	} else {
+		ac = m.st.cfg.ActiveAgent()
+	}
+	window := m.st.cfg.AgentContextWindowTokens(ac)
+
+	numerator := promptTokens
+	if m.busy {
+		numerator = int64(math.Round(float64(m.currentTurnInputChars) * 0.25))
+	}
+	if numerator <= 0 {
+		return ""
+	}
+
+	if window <= 0 {
+		// No context window configured — nothing to divide by. Still show
+		// the absolute size so the indicator is useful for self-regulation.
+		return dim(fmt.Sprintf("ctx:%s", formatTokenCount(numerator)))
+	}
+
+	pct := int(100 * float64(numerator) / float64(window))
+	label := fmt.Sprintf("ctx:%s/%s", formatTokenCount(numerator), formatTokenCount(int64(window)))
+	switch {
+	case pct >= contextPressureCriticalPct:
+		return red(label)
+	case pct >= contextPressureHighPct:
+		return yellow(label)
+	default:
+		return dim(label)
+	}
+}
+
+// activeTokenRole returns "escalation" or "primary" reflecting which agent will
+// handle (or is handling) the current turn. Mirrors agentLabel priority order.
+func (m *model) activeTokenRole() string {
+	st := m.st
+	if st.activeFallbackTarget == "escalation" {
+		return "escalation"
+	}
+	if st.activeFallbackTarget == "primary" {
+		return "primary"
+	}
+	if st.stickyEscalate || st.forceEscalate || st.autoStickyEscalate {
+		return "escalation"
+	}
+	if st.stickyPrimary || st.forcePrimary {
+		return "primary"
+	}
+	if st.sess.State == session.StateEscalation || st.sess.State == session.StateEscalationWaiting {
+		return "escalation"
+	}
+	return "primary"
+}
+
+// formatTokenCount formats a token count compactly: <1000 → exact, ≥1000 → "1.2k".
+func formatTokenCount(n int64) string {
+	switch {
+	case n < 1000:
+		return fmt.Sprintf("%d", n)
+	case n < 1000000:
+		return fmt.Sprintf("%.1fk", float64(n)/1000)
+	default:
+		return fmt.Sprintf("%.1fM", float64(n)/1000000)
+	}
+}
+
+// sessionRole maps session state to the human-readable role shown in the status bar.
+func sessionRole(s session.State) string {
+	switch s {
+	case session.StateLocal:
+		return "PRIMARY"
+	case session.StateEscalation:
+		return "ESCALATION"
+	case session.StateEscalationWaiting:
+		return "ESCALATION_WAITING"
+	default:
+		return "ROUTING"
+	}
+}
+
+func agentLabel(st *interactiveState) string {
+	localName := st.cfg.ActiveAgent().Name
+	if localName == "" {
+		localName = "local"
+	}
+	escalationName := st.cfg.EscalationAgentConfig().Name
+	if escalationName == "" {
+		escalationName = "escalation"
+	}
+	switch {
+	case st.activeFallbackTarget == "escalation":
+		return escalationName + " (fallback)"
+	case st.activeFallbackTarget == "primary":
+		return localName + " (fallback)"
+	case st.stickyEscalate:
+		return escalationName + " (pinned)"
+	case st.autoStickyEscalate:
+		return escalationName + " (sticky)"
+	case st.forceEscalate:
+		return escalationName + " (forced)"
+	case st.stickyPrimary:
+		return localName + " (pinned)"
+	case st.forcePrimary:
+		return localName + " (forced)"
+	case st.sess.State == session.StateEscalation || st.sess.State == session.StateEscalationWaiting:
+		return escalationName
+	default:
+		return localName
+	}
+}
+
+func (m *model) statusCwd() string {
+	cwd := m.st.cwd
+	if home, err := os.UserHomeDir(); err == nil {
+		if rel, err := filepath.Rel(home, cwd); err == nil && !strings.HasPrefix(rel, "..") {
+			return "~/" + rel
+		}
+	}
+	return cwd
+}

@@ -1,0 +1,345 @@
+package obs
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+)
+
+// TokenEntry accumulates token counts for one (model, agent-role) pair.
+type TokenEntry struct {
+	Model         string
+	Agent         string // "primary", "escalation", "router"
+	Prompt        int64
+	Completion    int64
+	CacheRead     int64
+	CacheCreation int64
+}
+
+var sessionAccumulator struct {
+	mu      sync.Mutex
+	entries map[string]*TokenEntry
+	turns   atomic.Int64
+}
+
+func init() { sessionAccumulator.entries = map[string]*TokenEntry{} }
+
+func accumulateSessionTokens(model, agent string, prompt, completion int64) {
+	key := model + "\x00" + agent
+	sessionAccumulator.mu.Lock()
+	e, ok := sessionAccumulator.entries[key]
+	if !ok {
+		e = &TokenEntry{Model: model, Agent: agent}
+		sessionAccumulator.entries[key] = e
+	}
+	e.Prompt += prompt
+	e.Completion += completion
+	sessionAccumulator.mu.Unlock()
+}
+
+func AccumulateCacheTokens(model, agent string, cacheRead, cacheCreation int64) {
+	if cacheRead == 0 && cacheCreation == 0 {
+		return
+	}
+	key := model + "\x00" + agent
+	sessionAccumulator.mu.Lock()
+	e, ok := sessionAccumulator.entries[key]
+	if !ok {
+		e = &TokenEntry{Model: model, Agent: agent}
+		sessionAccumulator.entries[key] = e
+	}
+	e.CacheRead += cacheRead
+	e.CacheCreation += cacheCreation
+	sessionAccumulator.mu.Unlock()
+}
+
+func IncrementTurnCount() { sessionAccumulator.turns.Add(1) }
+
+func SessionTotals() (entries []TokenEntry, turns int64) {
+	sessionAccumulator.mu.Lock()
+	defer sessionAccumulator.mu.Unlock()
+	for _, e := range sessionAccumulator.entries {
+		entries = append(entries, *e)
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Agent != entries[j].Agent {
+			return entries[i].Agent < entries[j].Agent
+		}
+		return entries[i].Model < entries[j].Model
+	})
+	return entries, sessionAccumulator.turns.Load()
+}
+
+func ResetSessionTokens() {
+	sessionAccumulator.mu.Lock()
+	sessionAccumulator.entries = map[string]*TokenEntry{}
+	sessionAccumulator.mu.Unlock()
+	sessionAccumulator.turns.Store(0)
+}
+
+func SessionPromptTotal() int64 {
+	sessionAccumulator.mu.Lock()
+	defer sessionAccumulator.mu.Unlock()
+	var t int64
+	for _, e := range sessionAccumulator.entries {
+		t += e.Prompt
+	}
+	return t
+}
+
+func SessionCompletionTotal() int64 {
+	sessionAccumulator.mu.Lock()
+	defer sessionAccumulator.mu.Unlock()
+	var t int64
+	for _, e := range sessionAccumulator.entries {
+		t += e.Completion
+	}
+	return t
+}
+
+func SessionTokensByRole(role string) (prompt, completion int64) {
+	sessionAccumulator.mu.Lock()
+	defer sessionAccumulator.mu.Unlock()
+	for _, e := range sessionAccumulator.entries {
+		if e.Agent == role {
+			prompt += e.Prompt
+			completion += e.Completion
+		}
+	}
+	return
+}
+
+// SessionTokensByRolePrefix sums prompt and completion tokens for all roles
+// matching the prefix (exact or colon-separated sub-roles). E.g. prefix
+// "escalation" matches "escalation", "escalation:subagent", "escalation:workflow".
+func SessionTokensByRolePrefix(prefix string) (prompt, completion int64) {
+	sessionAccumulator.mu.Lock()
+	defer sessionAccumulator.mu.Unlock()
+	for _, e := range sessionAccumulator.entries {
+		if e.Agent == prefix || strings.HasPrefix(e.Agent, prefix+":") {
+			prompt += e.Prompt
+			completion += e.Completion
+		}
+	}
+	return
+}
+
+func SessionCacheByRole(role string) (cacheRead, cacheCreation int64) {
+	sessionAccumulator.mu.Lock()
+	defer sessionAccumulator.mu.Unlock()
+	for _, e := range sessionAccumulator.entries {
+		if e.Agent == role {
+			cacheRead += e.CacheRead
+			cacheCreation += e.CacheCreation
+		}
+	}
+	return
+}
+
+// SessionCacheByRolePrefix sums cache tokens for all roles matching the prefix
+// (exact or colon-separated sub-roles). Mirrors SessionTokensByRolePrefix.
+func SessionCacheByRolePrefix(prefix string) (cacheRead, cacheCreation int64) {
+	sessionAccumulator.mu.Lock()
+	defer sessionAccumulator.mu.Unlock()
+	for _, e := range sessionAccumulator.entries {
+		if e.Agent == prefix || strings.HasPrefix(e.Agent, prefix+":") {
+			cacheRead += e.CacheRead
+			cacheCreation += e.CacheCreation
+		}
+	}
+	return
+}
+
+type tkey struct{ metric, model, agent string }
+
+type SessionTokenEntry struct {
+	Model, Agent             string
+	Prompt, Completion       int64
+	CacheRead, CacheCreation int64
+}
+
+func FormatTokenUsage(ctx context.Context, otelDir string, sessEntries []SessionTokenEntry, turns int64) string {
+	_ = ctx
+	type rowKey struct{ agent, model string }
+	type row struct {
+		agent, model             string
+		prompt, completion       float64
+		cacheRead, cacheCreation int64
+	}
+	rowMap := map[rowKey]*row{}
+	path := filepath.Join(otelDir, "metrics.jsonl")
+	if f, err := os.Open(path); err == nil {
+		latest := map[tkey]float64{}
+		scanner := bufio.NewScanner(f)
+		scanner.Buffer(make([]byte, 256*1024), 256*1024)
+		for scanner.Scan() {
+			if line := scanner.Text(); line != "" {
+				parseTokenMetricLine(line, latest)
+			}
+		}
+		f.Close()
+		for k, v := range latest {
+			if k.metric != "milk.tokens.prompt" && k.metric != "milk.tokens.completion" {
+				continue
+			}
+			rk := rowKey{k.agent, k.model}
+			r, ok := rowMap[rk]
+			if !ok {
+				r = &row{agent: k.agent, model: k.model}
+				rowMap[rk] = r
+			}
+			if k.metric == "milk.tokens.prompt" {
+				r.prompt = v
+			} else {
+				r.completion = v
+			}
+		}
+	}
+	for _, e := range sessEntries {
+		rk := rowKey{e.Agent, e.Model}
+		r, ok := rowMap[rk]
+		if !ok {
+			r = &row{agent: e.Agent, model: e.Model}
+			rowMap[rk] = r
+		}
+		r.prompt += float64(e.Prompt)
+		r.completion += float64(e.Completion)
+		r.cacheRead += e.CacheRead
+		r.cacheCreation += e.CacheCreation
+	}
+	if len(rowMap) == 0 {
+		return "no token metrics recorded yet (run a few turns first)"
+	}
+	rows := make([]row, 0, len(rowMap))
+	for _, r := range rowMap {
+		rows = append(rows, *r)
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].agent != rows[j].agent {
+			return rows[i].agent < rows[j].agent
+		}
+		return rows[i].model < rows[j].model
+	})
+	var b strings.Builder
+	rule := "  " + strings.Repeat("─", 110)
+	header := func(title string) {
+		fmt.Fprintf(&b, "\n%s\n", title)
+		fmt.Fprintf(&b, "  %-16s  %-30s  %10s  %10s  %10s  %10s  %10s  %6s\n", "role", "model", "prompt", "completion", "total", "cache_read", "cache_wrt", "hit%")
+		fmt.Fprintln(&b, rule)
+	}
+	// hitRate is the fraction of TOTAL input tokens (fresh prompt + cacheRead +
+	// cacheCreation) served from cache. prompt must already be fresh-only (not
+	// inclusive of cacheRead) — every provider path normalizes to that
+	// convention before recording, so cacheRead/cacheCreation are additive with
+	// it, not a subset of it.
+	hitRate := func(prompt float64, read, creation int64) string {
+		total := prompt + float64(read+creation)
+		if total == 0 {
+			return "—"
+		}
+		return fmt.Sprintf("%.1f%%", 100*float64(read)/total)
+	}
+	cacheRow := func(read, creation int64) (string, string) {
+		if read == 0 && creation == 0 {
+			return "—", "—"
+		}
+		return fmt.Sprintf("%d", read), fmt.Sprintf("%d", creation)
+	}
+	footer := func(p, c float64, cacheRead, cacheCreation int64) {
+		cr, cw := cacheRow(cacheRead, cacheCreation)
+		fmt.Fprintln(&b, rule)
+		fmt.Fprintf(&b, "  %-48s  %10.0f  %10.0f  %10.0f  %10s  %10s  %6s\n", "total", p, c, p+c, cr, cw, hitRate(p, cacheRead, cacheCreation))
+	}
+	header("token usage (cumulative):")
+	var grandPrompt, grandCompletion float64
+	var grandCacheRead, grandCacheCreation int64
+	for _, r := range rows {
+		grandPrompt += r.prompt
+		grandCompletion += r.completion
+		grandCacheRead += r.cacheRead
+		grandCacheCreation += r.cacheCreation
+		cr, cw := cacheRow(r.cacheRead, r.cacheCreation)
+		fmt.Fprintf(&b, "  %-16s  %-30s  %10.0f  %10.0f  %10.0f  %10s  %10s  %6s\n", r.agent, r.model, r.prompt, r.completion, r.prompt+r.completion, cr, cw, hitRate(r.prompt, r.cacheRead, r.cacheCreation))
+	}
+	footer(grandPrompt, grandCompletion, grandCacheRead, grandCacheCreation)
+	if len(sessEntries) > 0 {
+		header(fmt.Sprintf("this session (%d turns):", turns))
+		var sp, sc float64
+		var sCacheRead, sCacheCreation int64
+		for _, e := range sessEntries {
+			cr, cw := cacheRow(e.CacheRead, e.CacheCreation)
+			fmt.Fprintf(&b, "  %-16s  %-30s  %10d  %10d  %10d  %10s  %10s  %6s\n", e.Agent, e.Model, e.Prompt, e.Completion, e.Prompt+e.Completion, cr, cw, hitRate(float64(e.Prompt), e.CacheRead, e.CacheCreation))
+			sp += float64(e.Prompt)
+			sc += float64(e.Completion)
+			sCacheRead += e.CacheRead
+			sCacheCreation += e.CacheCreation
+		}
+		footer(sp, sc, sCacheRead, sCacheCreation)
+	}
+	procEntries, procTurns := SessionTotals()
+	if len(procEntries) > 0 {
+		header(fmt.Sprintf("since start (%d turns):", procTurns))
+		var pp, pc float64
+		var pCacheRead, pCacheCreation int64
+		for _, e := range procEntries {
+			cr, cw := cacheRow(e.CacheRead, e.CacheCreation)
+			fmt.Fprintf(&b, "  %-16s  %-30s  %10d  %10d  %10d  %10s  %10s  %6s\n", e.Agent, e.Model, e.Prompt, e.Completion, e.Prompt+e.Completion, cr, cw, hitRate(float64(e.Prompt), e.CacheRead, e.CacheCreation))
+			pp += float64(e.Prompt)
+			pc += float64(e.Completion)
+			pCacheRead += e.CacheRead
+			pCacheCreation += e.CacheCreation
+		}
+		footer(pp, pc, pCacheRead, pCacheCreation)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func parseTokenMetricLine(line string, out map[tkey]float64) {
+	var root struct {
+		ScopeMetrics []struct {
+			Metrics []struct {
+				Name string `json:"Name"`
+				Data struct {
+					DataPoints []struct {
+						Attributes []struct {
+							Key   string `json:"Key"`
+							Value struct {
+								Value any `json:"Value"`
+							} `json:"Value"`
+						} `json:"Attributes"`
+						Value float64 `json:"Value"`
+					} `json:"DataPoints"`
+				} `json:"Data"`
+			} `json:"Metrics"`
+		} `json:"ScopeMetrics"`
+	}
+	if err := json.Unmarshal([]byte(line), &root); err != nil {
+		return
+	}
+	for _, sm := range root.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if !strings.HasPrefix(m.Name, "milk.tokens.") {
+				continue
+			}
+			for _, dp := range m.Data.DataPoints {
+				var model, agent string
+				for _, a := range dp.Attributes {
+					switch a.Key {
+					case "model":
+						model = fmt.Sprintf("%v", a.Value.Value)
+					case "agent":
+						agent = fmt.Sprintf("%v", a.Value.Value)
+					}
+				}
+				out[tkey{m.Name, model, agent}] = dp.Value
+			}
+		}
+	}
+}

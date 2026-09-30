@@ -1,0 +1,3892 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"reflect"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	rw "github.com/mattn/go-runewidth"
+
+	"github.com/atotto/clipboard"
+	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+
+	"go.opentelemetry.io/otel/attribute"
+
+	"github.com/scoutme/milk/internal/agent/aider"
+	"github.com/scoutme/milk/internal/agent/claude"
+	"github.com/scoutme/milk/internal/agent/local"
+	"github.com/scoutme/milk/internal/agent/smolagent"
+	"github.com/scoutme/milk/internal/agent/subprocess"
+	"github.com/scoutme/milk/internal/claudesettings"
+	"github.com/scoutme/milk/internal/config"
+	"github.com/scoutme/milk/internal/loop"
+	"github.com/scoutme/milk/internal/mcp"
+	"github.com/scoutme/milk/internal/memory"
+	"github.com/scoutme/milk/internal/obs"
+	"github.com/scoutme/milk/internal/router"
+	"github.com/scoutme/milk/internal/session"
+	"github.com/scoutme/milk/internal/shelldetect"
+	"github.com/scoutme/milk/internal/tasks"
+	"github.com/scoutme/milk/internal/updater"
+	"github.com/scoutme/milk/internal/workflow"
+	"github.com/scoutme/milk/internal/workflow/interp"
+)
+
+const agentTimeout = 10 * time.Minute
+
+const memoryPanelWidth = 33 // chars for the memory panel (32 inner + 1 right scrollbar)
+const memoryPanelInner = 32 // usable inner chars; scrollbar is a separate column in View()
+const memoryPollInterval = 5 * time.Second
+
+// dispatchAgents holds the agents and their availability for a turn.
+// primary and escalation are the TurnRunner instances used for dispatch.
+// local is kept for router classification and in-place credential refresh.
+// cliAgent, escalationLocal, subprocessAgent, subprocessPrimary are kept for
+// TUI callback wiring in dispatchAgent and live-rebuild in commitSwitchAgent.
+type dispatchAgents struct {
+	// TurnRunner dispatch targets (set from runREPL / commitSwitchAgent)
+	primary    TurnRunner
+	escalation TurnRunner
+	// Underlying typed agents (needed for TUI callback wiring and live-rebuild)
+	local             *local.Agent
+	cliAgent          *claude.Agent
+	escalationLocal   *local.Agent      // non-nil when escalation target is a local provider
+	subprocessAgent   *subprocess.Agent // non-nil when escalation target is a subprocess provider
+	subprocessPrimary *subprocess.Agent // non-nil when primary is a subprocess provider
+	localAvail        bool
+	escalationAvail   bool
+	toolRunners       map[string]TurnRunner // lazily built tool-agent runners, keyed by agent name
+	// mcpToolSets holds the live MCP ToolSet for each agent that has MCP servers
+	// configured, keyed by agent name. Used by /mcp list and /mcp reconnect.
+	mcpToolSets map[string]*mcp.ToolSet
+	// mcpServersSeen caches the EffectiveMCPServers resolution last used to
+	// build mcpToolSets/mcpServers for each agent name, so refreshMCPForRole
+	// can skip rebuilding when nothing has actually changed.
+	mcpServersSeen map[string][]config.MCPServerConfig
+	// backgroundMgr tracks spawn_background_agent jobs (ADR-0043) across
+	// however many turns this session runs. Constructed once per session
+	// (not per turn — buildTUIAgents re-wires the same *Manager onto each
+	// turn's freshly-copied local.Agent) with a base context that outlives
+	// any single turn's cancellable context. Nil when the active agent
+	// config doesn't support it (e.g. no local provider available yet).
+	backgroundMgr *local.Manager
+}
+
+// refreshMCPToolSets rebuilds the MCP toolset for the primary and escalation
+// agents when their EffectiveMCPServers has changed since it was last built
+// — on a config-write event (the config-watcher reload path, or right after
+// any wizard/exec command saves a change that could affect MCPServers or an
+// agent's mcp_servers list). When nothing changed for a role, this is a
+// no-op: the existing runner/toolset is reused exactly as before, with no
+// added per-turn cost. A turn already in flight keeps using the
+// runner/toolset snapshot it started with — only the next turn on an
+// affected role sees the rebuilt one.
+func (m model) refreshMCPToolSets() model {
+	var changedPrimary, changedEscalation bool
+	m, changedPrimary = m.refreshMCPForRole(RolePrimary, activeLocalAgentConfig(m.st.cfg).Name)
+	m, changedEscalation = m.refreshMCPForRole(RoleEscalation, m.st.cfg.EscalationAgentConfig().Name)
+	if changedPrimary || changedEscalation {
+		m.appendTranscript(milkTag() + " MCP servers reconnected to match current config\n")
+	}
+	return m
+}
+
+// refreshMCPForRole rebuilds the live MCP connections/server list for the
+// TurnRunner currently serving role, if agentName's EffectiveMCPServers no
+// longer matches what was last built for it. Returns changed=true when a
+// rebuild happened.
+func (m model) refreshMCPForRole(role AgentRole, agentName string) (model, bool) {
+	if agentName == "" {
+		return m, false
+	}
+	newServers := m.st.cfg.EffectiveMCPServers(agentName)
+	if reflect.DeepEqual(newServers, m.agents.mcpServersSeen[agentName]) {
+		return m, false
+	}
+	if m.agents.mcpServersSeen == nil {
+		m.agents.mcpServersSeen = map[string][]config.MCPServerConfig{}
+	}
+	m.agents.mcpServersSeen[agentName] = newServers
+
+	var runner TurnRunner
+	if role == RolePrimary {
+		runner = m.agents.primary
+	} else {
+		runner = m.agents.escalation
+	}
+
+	switch r := runner.(type) {
+	case *localRunner:
+		old := m.agents.mcpToolSets[agentName]
+		_, ts, err := buildMCPToolSet(m.ctx, m.st.cfg, agentName)
+		if err != nil {
+			m.appendTranscript(fmt.Sprintf("%s MCP connect error (agent %q): %v\n", milkTag(), agentName, err))
+		}
+		if ts == nil {
+			ts = mcp.NewToolSet(nil)
+		}
+		if role == RolePrimary {
+			m.agents.local = m.agents.local.WithMCPToolSet(ts)
+			m.agents.primary = newLocalRunner(m.agents.local, agentName)
+		} else {
+			m.agents.escalationLocal = m.agents.escalationLocal.WithMCPToolSet(ts)
+			m.agents.escalation = newLocalRunner(m.agents.escalationLocal, agentName)
+		}
+		m = m.trackMCPToolSet(agentName, old, ts)
+	case *subprocessRunner:
+		old := m.agents.mcpToolSets[agentName]
+		servers, ts, err := buildMCPToolSet(m.ctx, m.st.cfg, agentName)
+		if err != nil {
+			m.appendTranscript(fmt.Sprintf("%s MCP connect error (agent %q): %v\n", milkTag(), agentName, err))
+		}
+		if ts == nil {
+			ts = mcp.NewToolSet(nil)
+		}
+		newRunner := r.withMCPToolSet(servers, ts)
+		if role == RolePrimary {
+			m.agents.primary = newRunner
+		} else {
+			m.agents.escalation = newRunner
+		}
+		m = m.trackMCPToolSet(agentName, old, ts)
+	case *cliRunner:
+		// No live connection in milk's own process — the claude subprocess
+		// connects directly via --mcp-config, regenerated fresh every turn
+		// (internal/agent/claude/claude.go writeMCPConfigFile). Only the
+		// cached server-name list needs updating.
+		m.agents.escalation = r.withMCPServers(newServers)
+	}
+	return m, true
+}
+
+// trackMCPToolSet closes old (if any) and records ts as the live toolset for
+// agentName, so /mcp list and the next refresh comparison see the update.
+func (m model) trackMCPToolSet(agentName string, old, ts *mcp.ToolSet) model {
+	if old != nil {
+		old.Close(m.ctx)
+	}
+	if m.agents.mcpToolSets == nil {
+		m.agents.mcpToolSets = map[string]*mcp.ToolSet{}
+	}
+	m.agents.mcpToolSets[agentName] = ts
+	return m
+}
+
+// --- TUI message types ---
+
+// chunkMsg carries a chunk of streamed agent output.
+type chunkMsg struct{ text string }
+
+// requestSizeMsg carries the exact marshaled size (bytes) of the request
+// just sent to a local-provider agent for the current turn, replacing the
+// live ctx% estimate's crude len(userInput)-based guess with the real
+// figure. Fired once per inference call, so a multi-step tool-calling turn
+// updates it again on each subsequent call.
+type requestSizeMsg struct{ bytes int64 }
+
+// prefixChunkMsg carries the agent-name prefix printed before streaming begins.
+// It is appended to the transcript but excluded from the live token estimate.
+type prefixChunkMsg struct{ text string }
+
+// thinkChunkMsg carries a chunk of streamed thinking/reasoning output, kept
+// separate from regular content so it can be shown or hidden independently.
+type thinkChunkMsg struct{ text string }
+
+// reasoningPromotedMsg signals that the current turn's already-streamed
+// reasoning text has been promoted (by the local agent) to become the
+// turn's actual final answer, so the accumulated thinking for this turn
+// should be discarded rather than persisted as a duplicate of the answer.
+type reasoningPromotedMsg struct{}
+
+// agentDoneMsg signals the agent goroutine finished.
+type agentDoneMsg struct{ err error }
+
+// backgroundJobStartedMsg is sent immediately when a spawn_background_agent
+// job (ADR-0043) is created — from Manager.SetOnStart, off the goroutine that
+// called Spawn (which may be a background tool-loop, not the TUI's own).
+// Used solely to auto-open the background-agents panel so its activity is
+// visible without the user having to notice and press F3 first; see
+// (*model).autoOpenBackgroundPanel.
+type backgroundJobStartedMsg struct{}
+
+// backgroundJobDoneMsg is sent immediately when a spawn_background_agent job
+// (ADR-0043) completes or fails — independent of, and typically well before,
+// the turn-boundary path (drainBackgroundJobs) that injects the same result
+// into the next turn's context. This is purely the live-notification path:
+// it lets the transcript/status bar reflect completion as soon as it
+// happens, without waiting for the user's next input.
+type backgroundJobDoneMsg struct{ job *local.Job }
+
+// backgroundBatchDoneMsg is sent exactly once when the last currently-
+// outstanding spawn_background_agent job finishes (Manager.SetOnBatchDone —
+// ActiveCount reaches 0), i.e. once per wave rather than once per job. This
+// is what actually turns "results are ready" into a real follow-up turn:
+// neither backgroundJobDoneMsg (a passive transcript line) nor the
+// turn-boundary drain path (which only runs when some other turn happens to
+// be dispatched) generates a response on their own.
+type backgroundBatchDoneMsg struct{}
+
+// backgroundSpawnedMsg is sent after a user-initiated background agent spawn
+// completes asynchronously (via tea.Cmd). Carries the job ID and label so
+// the Update handler can append the transcript confirmation.
+type backgroundSpawnedMsg struct {
+	jobID string
+	label string
+}
+
+// backgroundUserJobDoneMsg is sent when a user-initiated background job
+// (spawned via the busy-key "Ctrl+Enter" flow, not a tool call)
+// finishes. Unlike backgroundBatchDoneMsg, this fires per job rather than
+// waiting for a whole wave — there's nothing to consolidate; the user forked
+// off one specific side-question and the result should reach the main agent
+// as soon as it's free, not held back for unrelated jobs still running.
+type backgroundUserJobDoneMsg struct{}
+
+// startWorkflowFromToolMsg is sent when a local-provider agent's
+// start_workflow tool call signals a launch request (dispatch.go's
+// onWorkflowStart callback, wired from the turn-dispatch goroutine). Handled
+// by launching the workflow directly via launchGenericWorkflow, bypassing
+// the interactive per-role wizard entirely — ws.Roles already has every role
+// resolved (explicit override or defaulted to "escalation" by
+// dispatchOneTool), since a tool call has no way to answer wizard prompts.
+type startWorkflowFromToolMsg struct{ ws *local.WorkflowStartSignal }
+
+// directBashDoneMsg is sent when a direct-bash command exits (PTY or ExecProcess path).
+type directBashDoneMsg struct {
+	err     error
+	logPath string // path to script(1) typescript; empty when using PTY pane
+}
+
+// ptyOutputMsg is sent by the PTY read goroutine whenever new bytes have been
+// written to the VT emulator. Triggers a View() re-render of the PTY pane.
+type ptyOutputMsg struct{}
+
+// turnTimeoutWarningMsg is sent when a turn exceeds its configured timeout but
+// the turn is still running. The turn is not cancelled — this is a soft warning.
+type turnTimeoutWarningMsg struct{ agentName string }
+
+type spinnerTickMsg struct{}
+
+// workflowIdleCheckMsg is sent periodically while a workflow is running. It
+// checks whether the current role's turn has exceeded that agent's configured
+// turn timeout since the last streamed activity, and warns once per idle
+// stretch — the workflow equivalent of turnTimeoutWarningMsg, needed because a
+// workflow's overall run spans many turns rather than the single turn a
+// one-shot timer could cover.
+type workflowIdleCheckMsg struct{}
+
+// copyFeedbackClearMsg clears the transient copy confirmation in the status bar.
+type copyFeedbackClearMsg struct{}
+
+// busyHintClearMsg clears the transient "agent is responding" hint in the status bar.
+type busyHintClearMsg struct{}
+
+// quitPendingClearMsg clears the "press ctrl+c again to exit" hint.
+type quitPendingClearMsg struct{}
+
+// dragResetMsg fires when the mouse-drag safety timeout expires.  If the
+// terminal's MouseActionRelease event was dropped (pointer drifted outside
+// reported viewport bounds between frames), mode 1002 stays enabled and
+// wheel-scroll stops working.  The timeout — scheduled on press, rescheduled
+// on every motion, cancelled on release — detects this condition and resets
+// the terminal to mode 1000 (basic tracking, reliable wheel).
+//
+// Each scheduling call increments the generation counter; a stale message
+// (generation mismatch) is ignored so that a timeout from an earlier motion
+// cannot reset the mode while the user is still actively dragging.
+type dragResetMsg struct{ gen uint64 }
+
+// memoryRefreshMsg fires on a periodic tick to redraw the memory panel.
+type memoryRefreshMsg struct{}
+
+// taskStoreChangedMsg is sent whenever the task store mutates (create,
+// update, complete, delete — Store.SetOnChange fires on all of them), off
+// whatever goroutine made the change, typically a tool call mid-turn. Used
+// to auto-open the tasks panel so newly-active task content is visible
+// without the user having to notice and press F2 first; see
+// (*model).autoOpenPanel. Bubbletea's own post-Update redraw is what
+// actually repaints the panel — this message just carries the "wake up and
+// check" signal across goroutines.
+type taskStoreChangedMsg struct{}
+
+// toolUseMsg carries the name of a tool Claude just started calling.
+type toolUseMsg struct{ name string }
+
+// credRefreshReadyMsg is sent when a background credential refresh completes.
+// label identifies the provider (e.g. "AWS", "token_cmd"). err is non-nil on
+// failure; creds carries new AWS credentials when applicable (nil for token_cmd).
+type credRefreshReadyMsg struct {
+	label string
+	creds *claude.AWSCreds
+	err   error
+}
+
+// permRequestMsg is sent by the agent goroutine when it needs a y/n answer.
+// The agent blocks on respCh until the TUI sends a permResponseMsg back.
+// remoteInputMsg carries a prompt injected from the remote oversight interface.
+type remoteInputMsg struct{ text string }
+
+// configReloadMsg is sent when the config file changes on disk (via Watcher)
+// or when the user runs /reload. cfg is the freshly parsed config; err is
+// non-nil when the file could not be parsed (cfg is then the zero value and
+// the existing in-memory config should be kept).
+type configReloadMsg struct {
+	cfg config.Config
+	err error
+}
+type errMsg struct{ err error }
+
+// updateAvailableMsg is sent when the background update check finds a newer release.
+type updateAvailableMsg struct{ release *updater.Release }
+
+// workflowResumeCheckMsg is sent at startup when a saved workflow state file
+// was found for the current session. The TUI prints a one-line resume offer.
+type workflowResumeCheckMsg struct {
+	state *workflow.State
+	// genericName/genericTask are set instead of state for an unfinished
+	// interpreter-driven (non-"dev") checkpoint — it has no sprint/pass to
+	// report, just a name and task.
+	genericName string
+	genericTask string
+}
+
+// updateProgressMsg carries download progress during /update install.
+type updateProgressMsg struct{ done, total int64 }
+
+// updateDoneMsg signals a completed self-update attempt.
+type updateDoneMsg struct{ err error }
+
+type serverStartDoneMsg struct {
+	agentName string
+	url       string
+	pid       int
+	err       error
+}
+
+type serverStopDoneMsg struct {
+	agentName string
+	stopped   bool
+	err       error
+}
+
+// openFileMsg is sent by the agent goroutine (or /open command) to request that
+// the TUI open a file in the editor. The goroutine blocks on respCh until the
+// editor exits. path is the resolved file path to open.
+type openFileMsg struct {
+	path   string
+	respCh chan error // nil when sent from /open (no goroutine waiting)
+}
+
+type permRequestMsg struct {
+	prompt string
+	label  string // status-bar label; defaults to "[allow?]" when empty
+	respCh chan string
+}
+
+// oauthRequiredMsg is sent by the claude agent when stderr indicates an MCP
+// server requires OAuth authorization. serverName may be empty when not
+// detectable; authURL may be empty when no URL appeared in the error.
+type oauthRequiredMsg struct {
+	serverName string
+	authURL    string
+}
+
+// mcpOAuthStartedMsg is sent once /mcp auth has discovered the authorization
+// URL for a server (after RFC 9728/8414 discovery and, if needed, RFC 7591
+// dynamic client registration), so the transcript can print it and the
+// browser open can be attempted. The terminal state (success/failure) is
+// reported separately via credRefreshReadyMsg.
+type mcpOAuthStartedMsg struct {
+	serverName string
+	authURL    string
+}
+
+// forgetState holds the pending /forget confirmation dialog.
+type forgetState struct {
+	candidates []memory.Percept // matched percepts shown to the user
+}
+
+// undoEntry records a textarea snapshot for undo/redo.
+type undoEntry struct {
+	value  string
+	cursor int // rune offset
+}
+
+const undoMaxDepth = 100
+const undoCoalesceWindow = 2 * time.Second
+
+// sendWriter is an io.Writer that forwards each Write as a chunkMsg
+// via tea.Program.Send, enabling live streaming into the TUI viewport.
+type sendWriter struct {
+	send func(msg tea.Msg)
+}
+
+func (w *sendWriter) Write(p []byte) (int, error) {
+	if len(p) > 0 {
+		w.send(chunkMsg{text: string(p)})
+	}
+	return len(p), nil
+}
+
+// prefixWriter is an io.Writer that forwards writes as prefixChunkMsg,
+// excluded from the live output-token estimate.
+type prefixWriter struct {
+	send func(msg tea.Msg)
+}
+
+func (w *prefixWriter) Write(p []byte) (int, error) {
+	if len(p) > 0 {
+		w.send(prefixChunkMsg{text: string(p)})
+	}
+	return len(p), nil
+}
+
+// tuiInputReader implements inputReader for the TUI: sends a permRequestMsg
+// and blocks until the user responds via the TUI input area.
+type tuiInputReader struct {
+	send func(msg tea.Msg)
+}
+
+func (r *tuiInputReader) readLine(prompt string) (string, error) {
+	return r.readLineLabeled(prompt, "")
+}
+
+func (r *tuiInputReader) readLineLabeled(prompt, label string) (string, error) {
+	respCh := make(chan string, 1)
+	r.send(permRequestMsg{prompt: prompt, label: label, respCh: respCh})
+	return <-respCh, nil
+}
+
+// makeLocalPermAsk returns the permAsk callback for the local agent.
+// It reuses the existing TUI permRequestMsg flow: the goroutine blocks on a
+// channel while the TUI displays a yellow permission prompt to the user.
+// Grants are persisted to ps (may be nil). Session-level skipPermissions is
+// handled by the caller via WithSkipPermissions before this is ever called.
+func makeLocalPermAsk(ir *tuiInputReader, ps *local.PermStore) func(tool, summary string) bool {
+	return func(tool, summary string) bool {
+		prompt := fmt.Sprintf("\n%s permission request — primary agent tool: %s", milkTag(), bold(tool))
+		if summary != "" {
+			prompt += fmt.Sprintf("  (%s)", dim(summary))
+		}
+		prompt += fmt.Sprintf("\n%s Allow? [Y/n] ", milkTag())
+		yn, _ := ir.readLine(prompt)
+		if yn == "" || strings.EqualFold(yn, "y") {
+			return true
+		}
+		return false
+	}
+}
+
+// --- Styles ---
+
+var (
+	styleHeaderBar = lipgloss.NewStyle().
+			Background(lipgloss.AdaptiveColor{Light: "#1E2A4A", Dark: "#0E0E1A"}).
+			Foreground(lipgloss.AdaptiveColor{Light: "#D8E4F8", Dark: "#AABBCC"}).
+			BorderStyle(lipgloss.NormalBorder()).
+			BorderBottom(true).
+			BorderForeground(lipgloss.AdaptiveColor{Light: "#4466AA", Dark: "#334466"})
+	styleStatusBar = lipgloss.NewStyle().
+			Background(lipgloss.AdaptiveColor{Light: "#E5E5E5", Dark: "#2B2B2B"})
+	styleStatusBarPerm = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#1A1A00")).
+				Background(lipgloss.AdaptiveColor{Light: "#FFD700", Dark: "#B8860B"})
+	styleBorder = lipgloss.NewStyle().
+			BorderStyle(lipgloss.NormalBorder()).
+			BorderTop(true).
+			BorderForeground(lipgloss.AdaptiveColor{Light: "#AAA", Dark: "#555"})
+)
+
+// --- model ---
+
+type model struct {
+	vp     viewport.Model
+	ta     textarea.Model
+	width  int
+	height int
+	ready  bool
+
+	// transcript accumulator (pointer — strings.Builder must not be copied by value).
+	// Always contains the full content including thinking (dim-wrapped).
+	transcript *strings.Builder
+	// transcriptNoThink mirrors transcript but replaces thinking blocks with a
+	// "[thinking…]" placeholder. Both are maintained in parallel so toggling is
+	// instantaneous — no rebuild required.
+	transcriptNoThink *strings.Builder
+	// thinkingActiveInTurn is true while thinking tokens are arriving for the
+	// current turn. The placeholder is flushed to transcriptNoThink when the
+	// first regular content chunk or turn-end arrives.
+	thinkingActiveInTurn bool
+	// showThinking controls whether thinking content is visible in the viewport.
+	showThinking bool
+	// currentTurnThinking accumulates thinking text for the current in-progress
+	// turn so it can be stored in session.Turn.Thinking when the turn completes.
+	currentTurnThinking *strings.Builder
+
+	// spinner state
+	busy         bool
+	spinnerFrame int
+
+	// history navigation
+	sessionHistory     []string // entries for this session only (default navigation)
+	globalHistory      []string // entries across all sessions
+	useGlobalHistory   bool     // when true, navigate globalHistory instead
+	histIdx            int
+	saved              string
+	savedLeadingPasted bool // leadingPasted snapshot for saved, restored on historyForward back to it
+
+	// ctrl+r / ctrl+s incremental search state
+	searching     bool
+	searchForward bool // false = reverse (ctrl+r), true = forward (ctrl+s)
+	searchQuery   *strings.Builder
+	searchIdx     int // position in activeHistory() we last matched
+
+	// tab completion
+	tabMatches      []string // flat list of matching commands / @-paths
+	tabIdx          int      // index into tabMatches (for @-path and non-slash completions)
+	tabCmdIdx       int      // index of current command within tabMatches (slash completions)
+	tabVarIdx       int      // index of current variant within the current command's variants
+	tabLine         int      // line index the current tabMatches were built for
+	tabPrefix       string   // what the user had typed when Tab was first pressed
+	tabBeforeCursor string   // beforeCursor snapshot at session start; used for clean cycling
+	tabAfterCursor  string   // afterCursor snapshot at session start
+	tabSubcmdMode   bool     // true when tabMatches holds full sigs (subcommand/trailing-space mode)
+	tabHints        []string // hint lines shown below viewport (may have one entry highlighted)
+	tabHintsBase    []string // same lines without any highlight; source of truth for highlightHint
+	hintIdx         int      // selected inline hint (-1 = none)
+
+	// pending permission request (non-nil while waiting for user y/n) and queue
+	// for tool-use permission prompts that arrive while a prior one is active.
+	pendingPerm *permRequestMsg
+	permQueue   []permRequestMsg
+
+	// cancelTurn cancels the context of the running agent turn; nil when idle.
+	cancelTurn  context.CancelFunc
+	interrupted bool // set when user cancels a turn via ctrl+c
+
+	// pendingBackgroundFollowup is set when an agent-initiated
+	// spawn_background_agent wave finishes (backgroundBatchDoneMsg) while
+	// busy or otherwise blocked, so handleAgentDone can retry the
+	// auto-follow-up once idle again. Only fires once every job in the
+	// wave has finished (ActiveCount reaches 0) — the calling agent
+	// designed a consolidated, multi-part wave meant to be reported
+	// together.
+	pendingBackgroundFollowup bool
+	// pendingUserBackgroundFollowup is the equivalent for a user-initiated
+	// spawn (via the busy-key "Ctrl+Enter" flow below, not a
+	// tool call): there is no "wave" to consolidate, so this fires as soon
+	// as the model goes idle regardless of whether other jobs — agent- or
+	// user-initiated — are still running. Deliver what's ready rather than
+	// waiting on unrelated work the user didn't ask this particular
+	// request to wait for.
+	pendingUserBackgroundFollowup bool
+
+	// active tool use — non-empty while the escalation agent is executing a tool call
+	activeToolUse string
+
+	// panelManualOverride tracks which panels the user has explicitly
+	// shown/hidden (via /panel or its F1-F4 shortcut) this session. Once a
+	// region is in here, automatic "this panel's content just became
+	// active" opens (see autoOpenPanel) skip it — the user's own choice
+	// sticks over automatic management.
+	panelManualOverride map[panelRegion]bool
+
+	// memory panel
+	panelMemory        bool
+	panelOffset        int
+	mem                *memory.Store
+	lastPanelClickID   string
+	lastPanelClickTime time.Time
+
+	// tasks panel
+	panelTasks  bool
+	tasksOffset int
+	taskStore   *tasks.Store
+
+	// background-agents panel (ADR-0043)
+	panelBackground  bool
+	backgroundOffset int
+
+	// pending /forget confirmation
+	pendingForget *forgetState
+
+	// pendingAttachments holds files staged for the next agent turn via /attach
+	// or path-in-paste detection. Cleared after each successful submission.
+	pendingAttachments []PendingAttachment
+
+	// pendingPathPaste is set when the user pastes what looks like a file path.
+	// The TUI asks "Attach as file? [y/N]" and this holds the path until answered.
+	pendingPathPaste string
+
+	// pending /agent add wizard
+	pendingAdd *addAgentState
+
+	// pending /mcp add wizard
+	pendingMCPAdd *addMCPState
+
+	// pending /agent switch wizard
+	pendingSwitch *switchAgentState
+
+	// pending /setup telegram wizard
+	pendingTelegramSetup *telegramSetupState
+
+	// pending /init wizard
+	pendingInit *initWizardState
+
+	// prompt width (visual columns) set by the most recent refreshPrompt call;
+	// used by taRows() to compute the exact content wrap width.
+	promptWidth int
+
+	// click-to-select state (content-space coordinates; -1 = none)
+	selAnchorLine    int
+	selAnchorCol     int
+	selEndLine       int
+	selEndCol        int
+	selDragging      bool   // true once the mouse has moved after the initial press
+	selText          string // plain text of the selected range (populated after release)
+	dragResetPending bool   // true while a drag-timeout cmd is outstanding
+	dragResetGen     uint64 // generation counter; stale dragResetMsgs are ignored
+
+	// click-to-select state for the memory/workflow side panels (panel-local
+	// coordinates; -1 = none). Kept separate from the transcript selection above
+	// so a click in one region never bleeds into the other's highlight.
+	panelSelRegion     panelRegion
+	panelSelAnchorLine int
+	panelSelAnchorCol  int
+	panelSelEndLine    int
+	panelSelEndCol     int
+	panelSelDragging   bool
+	panelSelText       string
+
+	copyFeedback   string // transient "[copied N chars]" shown in status bar
+	busyHint       string // transient "agent is responding" shown in status bar
+	credRefreshing bool   // true while any background credential refresh is running
+	credLabel      string // which credential is being refreshed (e.g. "AWS", "token")
+	credStatus     string // non-empty after refresh completes: last result message
+	credOK         bool   // true if last refresh succeeded, false if failed
+
+	// keyboard selection state in the input area (rune offsets into ta.Value(); -1 = none)
+	taSelAnchor int
+	taSelEnd    int
+
+	// undo/redo stacks for the input textarea
+	undoStack     []undoEntry
+	redoStack     []undoEntry
+	lastUndoTime  time.Time
+	lastUndoValue string // ta.Value() at the time of the last pushed entry
+
+	// quit confirmation state
+	quitPending bool
+
+	// pendingForceFresh is set to true in dispatchAgent when the turn begins with
+	// ForceFreshEscalation so that handleAgentDone can zero lastEscalationContextHash
+	// after the turn completes, preventing a stale hash from suppressing the fresh
+	// session's first context block.
+	pendingForceFresh bool
+
+	// pendingDirectBash is non-nil while waiting for y/N confirmation to run a
+	// shell command directly. The string holds the command to run on approval.
+	pendingDirectBash *string
+
+	// bangMode is true after the user presses "!" as the first character of
+	// an empty textarea — the Claude Code-style direct-execution-mode trigger.
+	// The "!" itself is consumed (never inserted into the textarea); only the
+	// prompt label changes to a red "!" while active. Entered/exited in
+	// handleKey (on "!" / backspace-on-empty), handleCtrlC (clearing the
+	// line), and handleEnter (on submit, which re-prepends "!" to the
+	// submitted text so submitInput's stripBangPrefix still applies).
+	bangMode bool
+
+	// leadingPasted is true when the character(s) at the very start of the
+	// current textarea buffer arrived via a real bracketed-paste event rather
+	// than being typed. Set in handleKey's msg.Paste branch when the cursor
+	// sits at absolute buffer offset 0 at the moment of the paste; cleared at
+	// every point the buffer is reset or replaced wholesale (submit, Ctrl+C
+	// clear, history recall). Used to keep slash/bang/direct-bash triggering
+	// gated to deliberately typed input — see submitInput and handleBusyKey
+	// (issue #151: pasted content, e.g. a copied transcript that happens to
+	// start with "/learn" or "!rm -rf", must not execute as a command).
+	leadingPasted bool
+
+	// ptyPane is non-nil while a shell command is running inside an embedded PTY.
+	ptyPane *ptyPaneState
+
+	// attached is non-nil while the TUI is showing a live-attach view over a
+	// background job's or workflow's live buffer instead of the main
+	// transcript viewport (ADR-0047; issue #154). See attach.go.
+	attached *attachState
+
+	// directBashConcurrentTurn is true when a direct-bash/bang command (via
+	// launchPTYPane or launchDirectBashFallback) was launched while an agent
+	// turn was already in progress — i.e. from handleBusyKey rather than the
+	// idle path (issue #128). directBashDoneMsg's cleanup uses this to avoid
+	// clobbering the still-running turn's busy/cancelTurn state, and to route
+	// the command's output into sess.PendingBangOutput for the next turn
+	// instead of relying solely on the (agent-invisible) transcript.
+	directBashConcurrentTurn bool
+
+	// hasInferenceAgent is true when the user has explicitly configured a
+	// local-agent backend. Used to show setup hints on the welcome screen.
+	hasInferenceAgent bool
+
+	// startupWarnings holds config validation warnings to print once the TUI is ready.
+	startupWarnings []string
+
+	// Per-agent session token totals; updated at turn end from the in-memory accumulator.
+	primaryPrompt     int64
+	primaryCompletion int64
+	escalationPrompt  int64
+	escalationComp    int64
+	// Cumulative cache tokens (used to compute total context input).
+	primaryCacheRead        int64
+	primaryCacheCreation    int64
+	escalationCacheRead     int64
+	escalationCacheCreation int64
+
+	// Live turn output: chars written during the current turn, used as a streaming proxy.
+	// Reset at turn start.
+	currentTurnChars int64
+	// currentTurnInputChars holds the estimated input size (bytes/chars) for
+	// the current turn's live ctx% status-bar estimate. Set to just the typed
+	// prompt's length at dispatch (a placeholder for the brief window before
+	// the first request goes out, and the only value ever available for
+	// non-local-provider agents, e.g. claude-cli); overwritten with the exact
+	// marshaled request payload size by requestSizeMsg once a local-provider
+	// agent actually sends the request — updated again on each subsequent
+	// call within a multi-step tool-calling turn.
+	currentTurnInputChars int64
+	// lastTurnPrompt/Completion are per-role deltas from the last completed turn
+	// for each agent, captured at agentDoneMsg. lastTurnCacheRead/Creation track
+	// the cache-token deltas for the same turn — needed by ctx:x/y to estimate
+	// the actual conversation size sent to the model (per-turn, not cumulative).
+	lastTurnPrompt      map[string]int64
+	lastTurnCompletion  map[string]int64
+	lastTurnCacheRead   map[string]int64
+	lastTurnCacheCreate map[string]int64
+	// lastTokenRole tracks which role's counters were last displayed; used to detect
+	// role changes and clear stale last-turn counters between turns.
+	lastTokenRole string
+
+	colorizeMode ColorizeMode
+
+	// colorize cache: avoid re-running chroma/glamour on every streamed token.
+	// The cache is invalidated when the transcript grows by ≥ colorizeLineThresh
+	// new lines, or when the viewport width changes, or when the caller
+	// explicitly sets colorizeForce = true (e.g. after agentDoneMsg, resize).
+	colorizeCached    string // last colorized output
+	colorizeTransLen  int    // transcript byte length when cache was built
+	colorizeVPWidth   int    // vpWidth when cache was built
+	colorizeForce     bool   // if true, bypass cache on next render
+	colorizeLinesSeen int    // new lines since last full re-colorize
+
+	// Per-turn colorization cache: stores colorized output for each completed
+	// turn (splitTurns segments ending with "\n\n"). Completed turns never
+	// change, so their cached colorized output remains valid across streaming
+	// updates. Only the last (incomplete) turn is re-colorized on cache miss.
+	// This makes full re-colorization O(last turn) instead of O(full transcript).
+	turnColorCache []string // colorized output per completed turn
+	turnRawCache   []string // raw text per completed turn (cache key)
+
+	// viewport rebuild throttle: bubbles/viewport.SetContent re-splits and
+	// re-measures the *entire* content on every call (including a full
+	// findLongestLineWidth scan milk never needs, since it never scrolls
+	// horizontally) — appendTranscript/appendThinking used to call it once per
+	// streamed chunk, so a long turn with heavy tool output made the TUI
+	// visibly lag. viewportDirty defers that rebuild to at most once per
+	// viewportRebuildThrottle window; every other setViewportContent/syncLayout
+	// call site (turn completion, resize, selection, …) is unaffected and still
+	// rebuilds immediately, and spinnerTickMsg (already firing every 80ms while
+	// busy) flushes any deferred rebuild so streamed text never lags by more
+	// than one tick.
+	viewportDirty       bool
+	lastViewportRebuild time.Time
+
+	// hintDebounceGen is incremented on every keystroke that triggers a hint
+	// rebuild. hintDebounceMsg carries the gen value at dispatch time; any
+	// message whose gen no longer matches is a stale firing and is dropped.
+	hintDebounceGen int
+
+	// credRefreshInit, if non-nil, is returned by Init() to start background
+	// credential refresh only after the bubbletea event loop is running.
+	credRefreshInit tea.Cmd
+
+	// workflowResumeInit, if non-nil, is returned by Init() to check for a
+	// saved workflow state file and emit workflowResumeCheckMsg when found.
+	workflowResumeInit tea.Cmd
+
+	// pendingUpdate is non-nil when an update is available but not yet installed.
+	pendingUpdate *updater.Release
+	// updateInstalling is true while /update install is downloading+applying.
+	updateInstalling bool
+	// updateProgress tracks download bytes for the progress indicator.
+	updateProgress int64
+	updateTotal    int64
+
+	// workflow panel
+	workflowPanelOpen            bool
+	workflowPanelOffset          int
+	workflowState                *workflow.State
+	pendingWorkflowWizard        *workflowWizardState
+	pendingGenericWorkflowExtend *genericWorkflowExtendState
+
+	// designer disambiguation
+	pendingWorkflowQuestions string        // raw questions from designer (non-nil while collecting answers)
+	workflowAnswersCh        chan<- string // channel to send user answers back to workflow goroutine
+
+	// workflow idle watchdog: mirrors the turnTimeoutWarningMsg mechanism used by
+	// normal turns, but reset on every workflow role transition/streamed chunk
+	// rather than a single one-shot timer, since a workflow runs many turns.
+	lastWorkflowActivity  time.Time
+	workflowTimeoutWarned bool
+
+	// loop detection
+	loopDetector  *loop.Detector
+	loopInterrupt bool   // true when a high-confidence loop signal fired
+	loopWarning   string // non-empty when a medium-confidence signal fired
+
+	// injected dependencies
+	ctx    context.Context
+	st     *interactiveState
+	rtr    *router.Router
+	agents dispatchAgents
+}
+
+func newModel(ctx context.Context, st *interactiveState, rtr *router.Router, agents dispatchAgents, mem *memory.Store) model {
+	ta := buildTextarea()
+	return model{
+		histIdx:             -1,
+		hintIdx:             -1,
+		ctx:                 ctx,
+		st:                  st,
+		rtr:                 rtr,
+		agents:              agents,
+		ta:                  ta,
+		transcript:          &strings.Builder{},
+		transcriptNoThink:   &strings.Builder{},
+		currentTurnThinking: &strings.Builder{},
+		searchQuery:         &strings.Builder{},
+		showThinking:        st.cfg.ShowReasoningDefault(),
+		mem:                 mem,
+		panelMemory:         true,
+		panelManualOverride: map[panelRegion]bool{},
+		selAnchorLine:       -1,
+		selEndLine:          -1,
+		panelSelRegion:      regionNone,
+		panelSelAnchorLine:  -1,
+		panelSelEndLine:     -1,
+		taSelAnchor:         -1,
+		taSelEnd:            -1,
+		lastUndoValue:       "\x00", // sentinel: never equals real textarea value, so first push always succeeds
+		lastTurnPrompt:      map[string]int64{"primary": 0, "escalation": 0},
+		lastTurnCompletion:  map[string]int64{"primary": 0, "escalation": 0},
+		lastTurnCacheRead:   map[string]int64{"primary": 0, "escalation": 0},
+		lastTurnCacheCreate: map[string]int64{"primary": 0, "escalation": 0},
+		loopDetector:        loop.New(st.cfg.LoopDetectionCfg()),
+	}
+}
+
+// refreshPrompt updates the textarea prompt label and width to match the current mode.
+func (m *model) refreshPrompt() {
+	var label string
+	if m.searching {
+		dir := "r"
+		if m.searchForward {
+			dir = "f"
+		}
+		label = yellow("("+dir+"-search)") + " ❯ "
+	} else if m.bangMode {
+		label = red("!") + " "
+	} else {
+		label = promptLabel(m.st)
+	}
+	plain := stripANSI(label)
+	m.promptWidth = rw.StringWidth(plain)
+
+	m.ta.SetPromptFunc(m.promptWidth, func(lineIdx int) string {
+		if lineIdx == 0 {
+			return label
+		}
+		return ""
+	})
+	if m.width > 0 {
+		// Match syncLayout's width: the textarea renders as content inside the
+		// transcript viewport, whose width is vpWidth() (mainWidth() minus the
+		// scrollbar column), not mainWidth() itself.
+		m.ta.SetWidth(m.vpWidth())
+	}
+}
+
+// inputLocked returns true when agent is running.
+func (m *model) inputLocked() bool { return m.busy }
+
+// isCtrlEnterCSI detects Ctrl+Enter from bubbletea's unknownCSISequenceMsg
+// String() representation ("?CSI[<decimal byte codes>]?"). Three known
+// terminal encodings: kitty CSI-u (13;5u), xterm modifyOtherKeys (27;5;13~),
+// and urxvt-style (13;5~). Ctrl modifier is always parameter 5.
+func isCtrlEnterCSI(s string) bool {
+	switch s {
+	case "?CSI[49 51 59 53 117]?", // ESC [ 13;5 u  (kitty CSI-u)
+		"?CSI[50 55 59 53 59 49 51 126]?", // ESC [ 27;5;13 ~  (xterm modifyOtherKeys)
+		"?CSI[49 51 59 53 126]?":          // ESC [ 13;5 ~  (urxvt)
+		return true
+	}
+	return false
+}
+
+// handleBusyKey handles key events while an agent turn is running.
+// It intercepts the three busy-specific cases, then delegates to handleKey
+// for all navigation, editing, history, undo/redo, and viewport scroll.
+// Safe slash commands (display/read-only) are executed immediately even during a turn.
+func (m model) handleBusyKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		if m.cancelTurn != nil {
+			m.cancelTurn()
+			m.cancelTurn = nil
+			m.interrupted = true
+		}
+		return m, nil
+	case "enter", "ctrl+m":
+		input := strings.TrimSpace(stripCompletionPlaceholders(m.ta.Value()))
+		// Bang mode consumed the "!" at keystroke time (same as handleEnter's
+		// idle path); re-prepend it so stripBangPrefix below still recognizes
+		// this as a direct-execution command.
+		if m.bangMode {
+			input = "!" + input
+			m.bangMode = false
+			m.refreshPrompt()
+		}
+		// "!" is always available regardless of busy state (issue #128): it's
+		// an explicit, agent-bypassing request, so it must not be silently
+		// funneled into the "Ctrl+Enter to spawn a background agent"
+		// flow below, which would hand an LLM agent the raw "!..." string —
+		// the agent has no special handling for milk's own bang syntax.
+		if shellCmd, ok := stripBangPrefix(input); ok && !m.leadingPasted {
+			m.ta.Reset()
+			m.leadingPasted = false
+			m.tabMatches = nil
+			m.tabIdx = -1
+			m.tabHints = nil
+			m.tabHintsBase = nil
+			m.busyHint = ""
+			m.syncLayout()
+			m.appendTranscript(promptLabel(m.st) + colorizeTokens(input) + "\n")
+			if shellCmd == "" {
+				return m, nil
+			}
+			return m.launchPTYPane(shellCmd)
+		}
+		if cmd, rest, found := extractSlashCommand(input); found && !m.leadingPasted {
+			if busySafeCommands[cmd] {
+				// Safe command: execute immediately without clearing busy state.
+				m.ta.Reset()
+				m.tabMatches = nil
+				m.tabIdx = -1
+				m.tabHints = nil
+				m.tabHintsBase = nil
+				m.syncLayout()
+				label := promptLabel(m.st)
+				m.appendTranscript(label + colorizeTokens(input) + "\n")
+				return m.handleSlashInput(cmd, rest)
+			}
+			m.busyHint = cmd + " unavailable while agent is responding"
+			return m, busyHintClearCmd()
+		}
+		if input == "" {
+			m.busyHint = "agent is responding — Ctrl+C to interrupt"
+			return m, busyHintClearCmd()
+		}
+		m.busyHint = "agent is working — Ctrl+Enter to spawn a background agent with this"
+		return m, busyHintClearCmd()
+	case "ctrl+j":
+		// Ctrl+Enter fallback: terminals without extended key protocols send
+		// \n (Ctrl+J) for Ctrl+Enter, which bubbletea reports as KeyCtrlJ —
+		// distinct from Enter (\r / KeyEnter). Primary Ctrl+Enter CSI
+		// handling lives in the main Update switch (unknownCSISequenceMsg).
+		input := strings.TrimSpace(stripCompletionPlaceholders(m.ta.Value()))
+		if input == "" {
+			return m, nil
+		}
+		return m.spawnUserBackgroundAgent(input)
+	case "tab":
+		// Tab completion not available while busy — ignore silently.
+		return m, nil
+	}
+	return m.handleKey(msg)
+}
+
+// handlePermKey routes key events while a permission prompt is pending.
+// Only enter submits; anything else is passed to the textarea normally.
+func (m model) handlePermKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		m.pendingPerm.respCh <- "n"
+		m.appendTranscript("n\n")
+		m.pendingPerm = nil
+		m.dequeueNextPerm()
+		return m, nil
+	case "enter":
+		answer := strings.TrimSpace(m.ta.Value())
+		m.ta.Reset()
+		m.leadingPasted = false
+		m.syncLayout()
+		m.appendTranscript(answer + "\n")
+		m.pendingPerm.respCh <- answer
+		m.pendingPerm = nil
+		m.dequeueNextPerm()
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.undoPush(true)
+	cmd = m.updateTA(msg)
+	m.syncLayout()
+	return m, cmd
+}
+
+// dequeueNextPerm promotes the next queued permission prompt, if any.
+func (m *model) dequeueNextPerm() {
+	if len(m.permQueue) == 0 {
+		return
+	}
+	next := m.permQueue[0]
+	m.permQueue = m.permQueue[1:]
+	m.pendingPerm = &next
+	m.appendTranscript(next.prompt)
+	m.ta.Reset()
+	m.leadingPasted = false
+	m.syncLayout()
+}
+
+func (m model) handlePermRequest(msg permRequestMsg) (tea.Model, tea.Cmd) {
+	if m.pendingPerm != nil {
+		m.permQueue = append(m.permQueue, msg)
+		return m, nil
+	}
+	m.pendingPerm = &msg
+	m.appendTranscript(msg.prompt)
+	m.ta.Reset()
+	m.leadingPasted = false
+	m.syncLayout()
+	return m, nil
+}
+
+func (m model) handleAgentDone(msg agentDoneMsg) (tea.Model, tea.Cmd) {
+	m.busy = false
+	m.activeToolUse = ""
+	m.cancelTurn = nil
+	m.busyHint = ""
+
+	if m.pendingForceFresh {
+		m.st.lastEscalationContextHash = ""
+		m.pendingForceFresh = false
+	}
+
+	// Attach accumulated thinking to the last assistant turn in the session.
+	if thinking := m.currentTurnThinking.String(); thinking != "" {
+		hist := m.st.sess.History
+		for i := len(hist) - 1; i >= 0; i-- {
+			if hist[i].Role == session.RoleAssistant {
+				hist[i].Thinking = thinking
+				break
+			}
+		}
+		m.currentTurnThinking.Reset()
+	}
+
+	if m.interrupted {
+		m.interrupted = false
+		m.appendTranscript(dim("[interrupted]") + "\n")
+	} else if msg.err != nil {
+		errText := msg.err.Error()
+		switch {
+		case isContextCanceled(msg.err):
+			// Turn was cancelled by the user — already handled by m.interrupted;
+			// this branch catches any late-arriving cancellation that slipped through.
+			m.appendTranscript(dim("[interrupted]") + "\n")
+		case isContextDeadlineExceeded(msg.err):
+			m.appendTranscript(milkTag() + " turn ended: context deadline exceeded\n")
+		default:
+			m.appendTranscript(milkTag() + " error: " + errText + "\n")
+		}
+	} else if m.currentTurnChars == 0 {
+		// No text or thinking was streamed and no error was reported — the agent
+		// produced no visible output. Show a placeholder so the turn is not silent.
+		m.appendTranscript(dim("[no response]") + "\n")
+	}
+	obs.IncrementTurnCount()
+	newPrimaryPrompt, newPrimaryCompletion := obs.SessionTokensByRole("primary")
+	newEscPrompt, newEscComp := obs.SessionTokensByRolePrefix("escalation")
+	newEscCacheRead, newEscCacheCreation := obs.SessionCacheByRolePrefix("escalation")
+	newPrimaryCacheRead, newPrimaryCacheCreation := obs.SessionCacheByRole("primary")
+	// Compute per-role per-turn deltas from the accumulators.
+	m.lastTurnPrompt["escalation"] = newEscPrompt - m.escalationPrompt
+	m.lastTurnCompletion["escalation"] = newEscComp - m.escalationComp
+	m.lastTurnPrompt["primary"] = newPrimaryPrompt - m.primaryPrompt
+	m.lastTurnCompletion["primary"] = newPrimaryCompletion - m.primaryCompletion
+	m.lastTurnCacheRead["escalation"] = newEscCacheRead - m.escalationCacheRead
+	m.lastTurnCacheCreate["escalation"] = newEscCacheCreation - m.escalationCacheCreation
+	m.lastTurnCacheRead["primary"] = newPrimaryCacheRead - m.primaryCacheRead
+	m.lastTurnCacheCreate["primary"] = newPrimaryCacheCreation - m.primaryCacheCreation
+	m.primaryPrompt, m.primaryCompletion = newPrimaryPrompt, newPrimaryCompletion
+	m.escalationPrompt, m.escalationComp = newEscPrompt, newEscComp
+	m.primaryCacheRead, m.primaryCacheCreation = newPrimaryCacheRead, newPrimaryCacheCreation
+	m.escalationCacheRead, m.escalationCacheCreation = newEscCacheRead, newEscCacheCreation
+	m.lastTokenRole = m.activeTokenRole()
+	m.currentTurnChars = 0
+	m.currentTurnInputChars = 0
+
+	// Loop detection: feed turn summary and check for signals.
+	if m.loopDetector != nil {
+		turnText := ""
+		reasoningText := ""
+		if hist := m.st.sess.History; len(hist) > 0 {
+			turnText = hist[len(hist)-1].Content
+			reasoningText = hist[len(hist)-1].Thinking
+		}
+		turnDelta := m.lastTurnPrompt[m.activeTokenRole()] + m.lastTurnCompletion[m.activeTokenRole()]
+		verdicts := m.loopDetector.Feed(loop.TurnSummary{
+			Text:          turnText,
+			ReasoningText: reasoningText,
+			InputTokens:   m.lastTurnPrompt[m.activeTokenRole()],
+			OutputTokens:  m.lastTurnCompletion[m.activeTokenRole()],
+			Timestamp:     time.Now(),
+			IsUserTurn:    false,
+		})
+		for _, v := range verdicts {
+			if v.Confidence >= 0.8 {
+				m.appendTranscript(yellow(fmt.Sprintf("[⚠ loop detected: %s (confidence %.0f%%)]\n", v.Message, v.Confidence*100)))
+				if m.loopDetector != nil && v.ShouldInterrupt {
+					m.loopInterrupt = true
+				}
+			} else if v.Confidence >= 0.5 && m.loopWarning == "" {
+				m.loopWarning = fmt.Sprintf("⚠ %s", v.Message)
+			}
+		}
+		_ = turnDelta // used for future velocity display
+	}
+
+	m.appendTranscript("\n")
+	m.colorizeForce = true // turn finished — force a clean full re-colorize
+	m.refreshPrompt()
+	m.syncLayout()
+
+	if m.pendingUserBackgroundFollowup {
+		return m.maybeAutoFollowupBackgroundJobs(false)
+	}
+	if m.pendingBackgroundFollowup {
+		return m.maybeAutoFollowupBackgroundJobs(true)
+	}
+	if len(m.st.pendingRemoteInputs) > 0 {
+		next := m.st.pendingRemoteInputs[0]
+		m.st.pendingRemoteInputs = m.st.pendingRemoteInputs[1:]
+		return m.submitInput(next, dim("[telegram]")+" ")
+	}
+	return m, nil
+}
+
+func isContextCanceled(err error) bool {
+	return errors.Is(err, context.Canceled)
+}
+
+func isContextDeadlineExceeded(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded)
+}
+
+func cleanupCLIImageFiles(st *interactiveState) {
+	for _, p := range st.pendingCLIImageFiles {
+		os.Remove(p) //nolint:errcheck
+	}
+	st.pendingCLIImageFiles = nil
+}
+
+// isEOFOrClosed reports whether err is a normal PTY/pipe EOF or "file already closed"
+// that occurs when the PTY master is closed after the child exits.
+func isEOFOrClosed(err error) bool {
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+	// os.ErrClosed is wrapped by the PTY read when the master fd is closed.
+	return errors.Is(err, os.ErrClosed)
+}
+
+// setMouseDragMode switches the terminal's mouse-tracking level between the
+// at-rest mode (1000, X10 basic — reliable wheel-scroll reporting) and the
+// drag mode (1002, button-motion — needed to receive MouseActionMotion events
+// for live selection-highlight updates). Call with true on drag start and
+// false on drag end; safe to call redundantly.
+func setMouseDragMode(dragging bool) {
+	if dragging {
+		os.Stdout.WriteString("\x1b[?1000l\x1b[?1002h") //nolint:errcheck
+	} else {
+		os.Stdout.WriteString("\x1b[?1002l\x1b[?1000h") //nolint:errcheck
+	}
+}
+
+func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if m.ptyPane != nil {
+		// The PTY pane's View() branch takes over the whole main area and
+		// renders no side panels (see layout.go), but mainWidth()/regionAt
+		// don't know that — a click at a panel's column while a PTY pane is
+		// up would otherwise silently arm/attach against a panel that isn't
+		// even on screen right now. Key routing already ignores everything
+		// but handlePTYKey while ptyPane is active; mirror that here.
+		return m, nil
+	}
+	ev := tea.MouseEvent(msg)
+	region, regionX := m.regionAt(ev.X)
+	var dragCmd tea.Cmd // set by press/motion; returned at the end
+	switch ev.Button {
+	case tea.MouseButtonWheelUp:
+		if p := m.panelOffsetPtr(region); p != nil {
+			if *p > 0 {
+				*p--
+			}
+		} else if m.attached != nil && !m.hasPendingPrompt() {
+			m.attached.vp.ScrollUp(3)
+		} else {
+			m.vp.ScrollUp(3)
+		}
+	case tea.MouseButtonWheelDown:
+		if p := m.panelOffsetPtr(region); p != nil {
+			if *p < m.panelMaxOffset(region, m.viewportHeight()) {
+				*p++
+			}
+		} else if m.attached != nil && !m.hasPendingPrompt() {
+			m.attached.vp.ScrollDown(3)
+		} else {
+			m.vp.ScrollDown(3)
+		}
+	case tea.MouseButtonLeft:
+		if region != regionNone {
+			return m.handlePanelMouse(region, regionX, ev)
+		}
+		// Only handle events inside the viewport area (rows 2..height-2).
+		const vpRowStart = 2
+		vpRowEnd := m.height - 2
+		if ev.Y < vpRowStart || ev.Y >= vpRowEnd || region != regionNone {
+			break
+		}
+		contentLine := m.vp.YOffset + (ev.Y - vpRowStart)
+		switch ev.Action {
+		case tea.MouseActionPress:
+			if ev.Ctrl && m.selAnchorLine >= 0 {
+				// Extend existing selection to clicked position.
+				m.selEndLine = contentLine
+				m.selEndCol = ev.X
+				m.selDragging = true
+				m.selText = m.selectionText()
+				m.setViewportContent()
+				setMouseDragMode(true)
+				m.dragResetPending = true
+				m.dragResetGen++
+				dragCmd = dragResetCmd(m.dragResetGen)
+				break
+			}
+			m.clearPanelSelection()
+			m.selAnchorLine = contentLine
+			m.selAnchorCol = ev.X
+			m.selEndLine = -1
+			m.selEndCol = 0
+			m.selDragging = false
+			m.selText = ""
+			m.setViewportContent()
+			setMouseDragMode(true)
+			m.dragResetPending = true
+			m.dragResetGen++
+			dragCmd = dragResetCmd(m.dragResetGen)
+		case tea.MouseActionMotion:
+			if m.selAnchorLine >= 0 {
+				m.selDragging = true
+				m.selEndLine = contentLine
+				m.selEndCol = ev.X
+				m.setViewportContent()
+				m.dragResetGen++
+				dragCmd = dragResetCmd(m.dragResetGen) // reschedule: release hasn't arrived yet
+			}
+		case tea.MouseActionRelease:
+			m.dragResetPending = false
+			setMouseDragMode(false)
+			if m.selAnchorLine >= 0 {
+				if contentLine == m.selAnchorLine && ev.X == m.selAnchorCol {
+					m.clearSelection()
+					m.setViewportContent()
+					return m, nil
+				}
+				m.selEndLine = contentLine
+				m.selEndCol = ev.X
+				m.selText = m.selectionText()
+				m.setViewportContent()
+			}
+		}
+	case tea.MouseButtonRight:
+		if ev.Action == tea.MouseActionPress {
+			// A drag whose release was dropped can leave mouse mode stuck at 1002;
+			// any subsequent click reliably arrives, so reset it defensively here.
+			m.dragResetPending = false
+			setMouseDragMode(false)
+			// Finalize any in-progress drag selection that lost its release event
+			// (release can be dropped when pointer drifts outside viewport bounds).
+			if m.selText == "" && m.selAnchorLine >= 0 && m.selDragging {
+				m.selText = m.selectionText()
+				m.setViewportContent()
+			}
+			if m.panelSelText == "" && m.panelSelAnchorLine >= 0 && m.panelSelDragging {
+				m.panelSelText = panelSelectionText(m.panelSelLines(), m.panelSelAnchorLine, m.panelSelAnchorCol, m.panelSelEndLine, m.panelSelEndCol)
+			}
+			// Transcript selection takes priority; then panel selection; then keyboard input selection.
+			if m.selText != "" {
+				copyToClipboard(m.selText)
+				m.copyFeedback = fmt.Sprintf("copied %d chars", len([]rune(m.selText)))
+				m.clearSelection()
+				m.setViewportContent()
+				return m, copyFeedbackClearCmd()
+			}
+			if m.panelSelText != "" {
+				copyToClipboard(m.panelSelText)
+				m.copyFeedback = fmt.Sprintf("copied %d chars", len([]rune(m.panelSelText)))
+				m.clearPanelSelection()
+				return m, copyFeedbackClearCmd()
+			}
+			if t := m.taSelText(); t != "" {
+				copyToClipboard(t)
+				m.copyFeedback = fmt.Sprintf("copied %d chars", len([]rune(t)))
+				m.taClearSel()
+				m.setViewportContent()
+				return m, copyFeedbackClearCmd()
+			}
+			// No selection: paste clipboard content into the textarea.
+			text, err := clipboard.ReadAll()
+			if err == nil && text != "" {
+				// Pre-expand to terminal height so repositionView() inside
+				// InsertString never scrolls on a multiline clipboard paste.
+				m.ta.SetHeight(m.height)
+				m.ta.InsertString(text)
+			}
+		}
+	}
+	return m, dragCmd
+}
+
+// welcomeScreen returns a centered welcome message shown when the transcript is empty.
+func (m *model) welcomeScreen() string {
+	vpH := m.vp.Height
+	if vpH <= 0 {
+		vpH = m.viewportHeight()
+	}
+	localAvail := m.agents.localAvail
+	escalationAvail := m.agents.escalationAvail
+
+	lines := []string{
+		pulseColors[8] + "◈" + ansiReset + " " + "\033[1;38;2;255;208;96mmilk\033[0m",
+		dim("switch models, not context."),
+		"",
+	}
+
+	primaryName := m.st.primaryAgentName()
+	escName := m.st.escalationAgentName()
+
+	switch {
+	case !m.hasInferenceAgent:
+		// No provider configured at all — show setup guidance.
+		lines = append(lines,
+			yellow("no primary agent configured"),
+			"",
+			dim("run the setup wizard to get started:"),
+			"› /config init",
+			"",
+			dim("or add a backend directly:"),
+			"",
+			dim("llama.cpp · Ollama · vLLM"),
+			"› /agent add url=http://localhost:8080 provider=local model=qwen2.5-coder",
+			"",
+			dim("AWS Bedrock"),
+			"› /agent add url=https://bedrock-runtime.<region>.amazonaws.com provider=bedrock model=<arn>",
+			"",
+			dim("OpenRouter · Together · Groq"),
+			"› /agent add url=https://openrouter.ai/api/v1 provider=bearer api_key=<key> model=<id>",
+			"",
+			dim("GitHub Copilot"),
+			"› /agent add provider=copilot model=gpt-4o",
+			"",
+			dim("Claude CLI"),
+			"› /agent add provider=claude-cli model=claude-sonnet-4-5",
+			"",
+			dim("Aider / custom subprocess"),
+			"› /agent add provider=aider-cli model=<model>",
+			"",
+		)
+		if !escalationAvail {
+			lines = append(lines,
+				dim("no escalation agent configured — run /config init to add one"),
+				"",
+			)
+		}
+		lines = append(lines, dim("/help for all commands"))
+	case !localAvail && !escalationAvail:
+		lines = append(lines,
+			yellow("no agents available"),
+			"",
+			dim(primaryName+" unreachable — check your provider config with /agent"),
+			dim(escName+" not available — escalation disabled"),
+			"",
+			dim("/help for available commands"),
+		)
+	case !localAvail:
+		lines = append(lines,
+			dim("type a message and press Enter to start"),
+			dim(primaryName+" unreachable — use /agent to check or switch backends"),
+			dim("/help for available commands"),
+		)
+	case !escalationAvail:
+		lines = append(lines,
+			dim("type a message and press Enter to start"),
+			"",
+			dim("routing: "+primaryName+"  ·  escalation disabled"),
+			dim("run /config init to add an escalation agent"),
+			"",
+			dim("/help for all commands  ·  /config init to reconfigure"),
+		)
+	default:
+		lines = append(lines,
+			dim("type a message and press Enter to start"),
+			"",
+			dim("routing: "+primaryName+" ↔ "+escName+"  ·  /escalate to pin  ·  /primary to unpin"),
+			dim("/need — set current goal  ·  F1-F4 — memory/tasks/agents/workflow panels  ·  /think on — reasoning tokens"),
+			dim("/config — view config  ·  /config init — reconfigure  ·  /config open — edit in $EDITOR"),
+			dim("--new — fresh session  ·  --resume — resume last session  ·  /help for all commands"),
+		)
+	}
+
+	padTop := (vpH - len(lines)) / 2
+	if padTop < 0 {
+		padTop = 0
+	}
+	var sb strings.Builder
+	for i := 0; i < padTop; i++ {
+		sb.WriteString("\n")
+	}
+	centered := lipgloss.NewStyle().Width(m.vpWidth()).Align(lipgloss.Center)
+	for _, l := range lines {
+		sb.WriteString(centered.Render(l))
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
+// --- Init ---
+
+func (m model) Init() tea.Cmd {
+	cmds := []tea.Cmd{
+		textarea.Blink,
+		tea.EnableBracketedPaste,
+		tea.EnterAltScreen,
+	}
+	if m.panelMemory {
+		cmds = append(cmds, memoryPollTick())
+	}
+	if m.credRefreshInit != nil {
+		cmds = append(cmds, m.credRefreshInit)
+	}
+	if m.workflowResumeInit != nil {
+		cmds = append(cmds, m.workflowResumeInit)
+	}
+	if m.st.cfg.ShouldCheckUpdate() {
+		cfg := m.st.cfg
+		cmds = append(cmds, func() tea.Msg {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			rel, err := updater.CheckLatest(ctx, version, cfg.UpdateCheckIncludePrerelease())
+			if err != nil || rel == nil {
+				return nil
+			}
+			return updateAvailableMsg{release: rel}
+		})
+	}
+	return tea.Batch(cmds...)
+}
+
+// --- Update ---
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Ctrl+Enter arrives as bubbletea's unexported unknownCSISequenceMsg
+	// ([]byte) in terminals with extended key protocols — detect via its
+	// String() representation before the main type switch, which cannot
+	// match on the unexported type. The universal fallback (Ctrl+J, which
+	// some terminals send for Ctrl+Enter) is handled as tea.KeyCtrlJ inside
+	// handleBusyKey.
+	if s, ok := msg.(fmt.Stringer); ok && m.inputLocked() && isCtrlEnterCSI(s.String()) {
+		input := strings.TrimSpace(stripCompletionPlaceholders(m.ta.Value()))
+		if input != "" {
+			return m.spawnUserBackgroundAgent(input)
+		}
+		return m, nil
+	}
+
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		return m.handleResize(msg)
+
+	case tea.KeyMsg:
+		if m.ptyPane != nil {
+			return m.handlePTYKey(msg)
+		}
+		// F1-F4: global panel show/hide shortcuts, available in any other
+		// mode (busy, permission prompt, wizards, ...) — none of them
+		// otherwise use function keys, and toggling how much of the
+		// screen a panel takes doesn't conflict with anything in-progress.
+		// Same effect as /panel <name>; having three-plus panels
+		// (memory/tasks/background, plus workflow) competing for space
+		// makes a quick toggle worth more than typing the command out.
+		switch msg.String() {
+		case "f1":
+			return m.handlePanelCmd("memory")
+		case "f2":
+			return m.handlePanelCmd("tasks")
+		case "f3":
+			return m.handlePanelCmd("background")
+		case "f4":
+			return m.handlePanelCmd("workflow")
+		}
+		// Adding a pending-state check below? Also add it to
+		// hasPendingPrompt() (layout.go) — it mirrors this list so the
+		// attach view (ADR-0047) knows to yield the screen to whichever
+		// prompt actually needs the user's attention, and nothing else
+		// keeps the two lists in sync.
+		if m.pendingDirectBash != nil {
+			return m.handleDirectBashKey(msg)
+		}
+		if m.pendingPerm != nil {
+			return m.handlePermKey(msg)
+		}
+		if m.pendingPathPaste != "" {
+			return m.handlePathPasteKey(msg)
+		}
+		if m.pendingForget != nil {
+			return m.handleForgetKey(msg)
+		}
+		if m.pendingAdd != nil {
+			return m.handleAddAgentKey(msg)
+		}
+		if m.pendingMCPAdd != nil {
+			return m.handleAddMCPKey(msg)
+		}
+		if m.pendingSwitch != nil {
+			return m.handleSwitchAgentKey(msg)
+		}
+		if m.pendingTelegramSetup != nil {
+			return m.handleTelegramSetupKey(msg)
+		}
+		if m.pendingInit != nil {
+			return m.handleInitWizardKey(msg)
+		}
+		if m.pendingWorkflowWizard != nil {
+			return m.handleWorkflowWizardKey(msg)
+		}
+		if m.pendingGenericWorkflowExtend != nil {
+			return m.handleGenericWorkflowExtendKey(msg)
+		}
+		if m.attached != nil {
+			// Below every pending prompt/wizard check above — attach is a
+			// passive viewing state, not a modal one, so a permission prompt
+			// or any other decision the user actually needs to make must
+			// still reach its own handler rather than being swallowed here.
+			return m.handleAttachKey(msg)
+		}
+		if m.inputLocked() {
+			return m.handleBusyKey(msg)
+		}
+		return m.handleKey(msg)
+
+	case remoteInputMsg:
+		if msg.text == "" {
+			return m, nil
+		}
+		if m.busy {
+			m.st.pendingRemoteInputs = append(m.st.pendingRemoteInputs, msg.text)
+			return m, nil
+		}
+		return m.submitInput(msg.text, dim("[telegram]")+" ")
+
+	case telegramGetMeMsg:
+		if msg.err != nil {
+			m.pendingTelegramSetup = nil
+			m.appendTranscript(fmt.Sprintf("%s token validation failed: %v\n", milkTag(), msg.err))
+			return m, nil
+		}
+		if m.pendingTelegramSetup != nil {
+			m.pendingTelegramSetup.botName = msg.botName
+			m.pendingTelegramSetup.step = telegramStepWaitMsg
+			m.appendTranscript(fmt.Sprintf("%s bot validated: @%s\n\n"+
+				"Now send any message to @%s on Telegram, then press Enter here.\n\n"+
+				milkTag()+" (press Enter when done) ",
+				milkTag(), msg.botName, msg.botName))
+		}
+		return m, nil
+
+	case telegramSetupResolvedMsg:
+		m.pendingTelegramSetup = nil
+		if msg.err != nil {
+			m.appendTranscript(fmt.Sprintf("%s %v\n", milkTag(), msg.err))
+			return m, nil
+		}
+		m = m.commitTelegramSetup(msg.token, msg.chatID)
+		return m, nil
+
+	case permRequestMsg:
+		return m.handlePermRequest(msg)
+
+	case oauthRequiredMsg:
+		notice := milkTag() + " MCP OAuth authorization required"
+		if msg.authURL != "" {
+			notice += "\n" + milkTag() + " authorization URL: " + msg.authURL
+		}
+		notice += "\n" + milkTag() + " run " + bold("/mcp auth <server-name>") + " to authorize"
+		m.appendTranscript(notice + "\n")
+		m.syncLayout()
+		return m, nil
+
+	case mcpOAuthStartedMsg:
+		notice := fmt.Sprintf("%s starting OAuth flow for MCP server %q\n%s authorization URL: %s\n%s opening your browser — if it doesn't open, paste the URL above into one\n",
+			milkTag(), msg.serverName, milkTag(), msg.authURL, milkTag())
+		m.appendTranscript(notice)
+		m.syncLayout()
+		return m, nil
+
+	case toolUseMsg:
+		m.activeToolUse = msg.name
+		return m, nil
+
+	case clipboardAttachMsg:
+		defer os.Remove(msg.path)
+		m = m.handleAttachCmd(msg.path)
+		return m, nil
+
+	case clipboardNoToolMsg:
+		m.appendTranscript(milkTag() + " clipboard paste: no non-text content found — on WSL2 powershell.exe is used automatically; on X11 install " + bold("xclip") + "; on Wayland install " + bold("wl-paste") + "\n")
+		return m, nil
+
+	case requestSizeMsg:
+		m.currentTurnInputChars = msg.bytes
+		return m, nil
+
+	case prefixChunkMsg:
+		m.currentTurnChars += int64(len(msg.text))
+		m.appendTranscriptStreamed(msg.text)
+		return m, nil
+
+	case chunkMsg:
+		m.currentTurnChars += int64(len(msg.text))
+		m.appendTranscriptStreamed(msg.text)
+		// Intra-turn loop detection: feed chunk and check for repetition.
+		if m.loopDetector != nil {
+			for _, v := range m.loopDetector.FeedChunk(msg.text) {
+				m.appendTranscript(yellow(fmt.Sprintf("\n[⚠ loop detected: %s (confidence %.0f%%)]\n", v.Message, v.Confidence*100)))
+				if v.ShouldInterrupt {
+					m.loopInterrupt = true
+					if m.cancelTurn != nil {
+						m.cancelTurn()
+					}
+				}
+			}
+		}
+		return m, nil
+
+	case thinkChunkMsg:
+		m.currentTurnChars += int64(len(msg.text))
+		m.currentTurnThinking.WriteString(msg.text)
+		m.appendThinkingStreamed(msg.text)
+		// Intra-turn loop detection: reasoning chunks get their own (higher)
+		// repetition threshold — see internal/loop.
+		if m.loopDetector != nil {
+			for _, v := range m.loopDetector.FeedReasoningChunk(msg.text) {
+				m.appendTranscript(yellow(fmt.Sprintf("\n[⚠ loop detected: %s (confidence %.0f%%)]\n", v.Message, v.Confidence*100)))
+				if v.ShouldInterrupt {
+					m.loopInterrupt = true
+					if m.cancelTurn != nil {
+						m.cancelTurn()
+					}
+				}
+			}
+		}
+		return m, nil
+
+	case reasoningPromotedMsg:
+		m.currentTurnThinking.Reset()
+		return m, nil
+
+	case agentDoneMsg:
+		return m.handleAgentDone(msg)
+
+	case ptyOutputMsg:
+		// Clear the pending flag so the read goroutine can enqueue the next refresh.
+		if m.ptyPane != nil {
+			atomic.StoreInt32(&m.ptyPane.pending, 0)
+		}
+		// Returning m triggers View() which redraws the PTY pane.
+		return m, nil
+
+	case directBashDoneMsg:
+		concurrentTurn := m.directBashConcurrentTurn
+		m.directBashConcurrentTurn = false
+		if !concurrentTurn {
+			// The PTY/fallback was the only reason busy was true — safe to
+			// clear. If it ran alongside an already-in-progress agent turn,
+			// that turn's own completion handler owns busy/cancelTurn.
+			m.busy = false
+			m.cancelTurn = nil
+			m.busyHint = ""
+		}
+		if m.ptyPane != nil {
+			// Snapshot the VT screen and append cleaned output to the transcript.
+			out := m.ptySnapshot()
+			if out != "" {
+				m.appendTranscript(dimLines(out))
+				m.currentTurnChars += int64(len(out))
+				if concurrentTurn && m.st != nil && m.st.sess != nil {
+					// Queue for the next dispatch prompt (issue #128) — the
+					// turn already in flight when this ran can't see it, and
+					// the agent has no special handling for milk's bang
+					// syntax, so the output (not the raw "!..." input) is
+					// what gets surfaced next turn.
+					m.st.sess.PendingBangOutput = append(m.st.sess.PendingBangOutput,
+						fmt.Sprintf("[direct command %q completed while agent was busy — output:\n%s]\n", m.ptyPane.shellCmd, out))
+				}
+			}
+			_ = m.ptyPane.ptm.Close()
+			m.ptyPane = nil
+		}
+		if msg.err != nil {
+			if _, ok := msg.err.(*exec.ExitError); !ok && !isEOFOrClosed(msg.err) {
+				m.appendTranscript(fmt.Sprintf("%s direct-bash error: %v\n", milkTag(), msg.err))
+			}
+		}
+		m.appendTranscript("\n")
+		m.refreshPrompt()
+		m.syncLayout()
+		return m, nil
+
+	case turnTimeoutWarningMsg:
+		if m.busy {
+			m.appendTranscript(dim(fmt.Sprintf("[%s is taking longer than expected — still waiting]", msg.agentName)) + "\n")
+			m.syncLayout()
+		}
+		return m, nil
+
+	case workflow.ProgressMsg:
+		// Update fields in place rather than replacing m.workflowState
+		// wholesale, so AgentMap and the full StageTree (set once at launch) survive every
+		// subsequent progress update.
+		if m.workflowState == nil {
+			m.workflowState = &workflow.State{}
+		}
+		m.workflowState.WorkflowName = msg.WorkflowName
+		m.workflowState.Task = msg.Task
+		m.workflowState.WorkflowID = msg.WorkflowID
+		m.workflowState.Role = msg.Role
+		if msg.ActivePaths != nil {
+			m.workflowState.ActiveStageTree = msg.ActivePaths.Root
+		}
+		if msg.CompletedPaths != nil {
+			m.workflowState.CompletedStageTree = msg.CompletedPaths.Root
+		}
+		m.workflowState.Generic = true
+		m.autoOpenPanel(regionWorkflow)
+		m.lastWorkflowActivity = time.Now()
+		m.workflowTimeoutWarned = false
+		m.syncLayout()
+		return m, nil
+
+	case workflow.WorkflowChunkMsg:
+		m.currentTurnChars += int64(len(msg.Text))
+		// Stage output goes to the workflow's own live buffer, not the main
+		// transcript (ADR-0047) — attach via the workflow panel to watch it.
+		if m.workflowState != nil {
+			m.workflowState.LiveBuffer().Append([]byte(msg.Text))
+		}
+		if m.attached != nil && m.attached.kind == attachWorkflow {
+			m.syncAttachedContent()
+		}
+		m.lastWorkflowActivity = time.Now()
+		m.workflowTimeoutWarned = false
+		m.syncLayout()
+		return m, nil
+
+	case workflowIdleCheckMsg:
+		if !m.busy || m.workflowState == nil {
+			return m, nil // workflow finished or was cancelled — stop rescheduling
+		}
+		if !m.workflowTimeoutWarned {
+			agentName := m.workflowState.AgentMap[m.workflowState.Role]
+			if agentCfg, ok := findAgentByName(m.st.cfg, agentName); ok {
+				timeout := m.st.cfg.AgentTurnTimeout(agentCfg)
+				if timeout > 0 && time.Since(m.lastWorkflowActivity) >= timeout {
+					m.workflowTimeoutWarned = true
+					m.appendTranscript(dim(fmt.Sprintf("[%s (%s) is taking longer than expected — still waiting; Ctrl+C to interrupt]", agentName, m.workflowState.Role)) + "\n")
+					m.syncLayout()
+				}
+			}
+		}
+		return m, workflowIdleCheck()
+
+	case workflow.WorkflowQuestionsMsg:
+		// Designer identified ambiguities — present questions to user.
+		// Unblock input so the user can type answers. The workflow goroutine
+		// is blocked on cfg.AnswersCh; we forward that exact channel here so
+		// the user's reply reaches it.
+		m.pendingWorkflowQuestions = msg.Questions
+		m.workflowAnswersCh = msg.AnswersCh // use the workflow goroutine's channel
+		m.busy = false                      // allow user input
+		m.busyHint = ""
+		if m.workflowState != nil {
+			// Distinguish "waiting on you" from "still generating" in the panel —
+			// otherwise it keeps showing "role: designer" throughout the pause too.
+			m.workflowState.Role = "waiting for your answers"
+		}
+		m.appendTranscript("\n" + milkTag() + " Designer has questions:\n")
+		m.appendTranscript(msg.Questions + "\n\n")
+		m.appendTranscript(milkTag() + " Please provide your answers (or press Enter to use defaults):\n")
+		m.refreshPrompt()
+		m.syncLayout()
+		return m, nil
+
+	case startWorkflowFromToolMsg:
+		reg, regErrs := workflow.LoadRegistry()
+		for _, e := range regErrs {
+			obs.Info("workflow.registry.load_error", "error", e.Error())
+		}
+		def, ok := reg.Lookup(msg.ws.Name)
+		if !ok {
+			// Shouldn't happen — dispatchOneTool already validated the name
+			// against the same registry before returning the signal — but
+			// the registry re-reads ~/.milk/workflows/ on every LoadRegistry
+			// call, so a file removed between the tool call and here would
+			// land here instead of failing earlier.
+			m.appendTranscript(milkTag() + fmt.Sprintf(" workflow %q no longer found — not starting\n", msg.ws.Name))
+			m.refreshPrompt()
+			return m, nil
+		}
+		w := &workflowWizardState{
+			name:       msg.ws.Name,
+			task:       msg.ws.Task,
+			def:        def,
+			roles:      def.Roles,
+			roleValues: msg.ws.Roles,
+		}
+		return m.launchGenericWorkflow(w)
+
+	case workflow.WorkflowDoneMsg:
+		m.busy = false
+		m.cancelTurn = nil
+		m.busyHint = ""
+		obs.IncrementTurnCount()
+		m.currentTurnChars = 0
+		m.currentTurnInputChars = 0
+		m.autoOpenPanel(regionWorkflow)
+		if m.workflowState != nil {
+			m.workflowState.Role = "done"
+			m.workflowState.ActiveStageTree = nil
+		}
+		if m.interrupted {
+			m.interrupted = false
+			m.appendTranscript(dim("[interrupted]") + "\n")
+		} else if isContextCanceled(msg.Err) {
+			m.appendTranscript(dim("[interrupted]") + "\n")
+		} else if msg.Err != nil {
+			if genericExhausted := (*interp.ExhaustedError)(nil); errors.As(msg.Err, &genericExhausted) && m.workflowState != nil && m.pendingWorkflowWizard == nil {
+				// Offer to continue with a doubled iteration limit.
+				reg, regErrs := workflow.LoadRegistry()
+				for _, e := range regErrs {
+					obs.Info("workflow.registry.load_error", "error", e.Error())
+				}
+				def, defOK := reg.Lookup(m.workflowState.WorkflowName)
+				if defOK {
+					w := &workflowWizardState{
+						name:       m.workflowState.WorkflowName,
+						task:       m.workflowState.Task,
+						def:        def,
+						roles:      def.Roles,
+						roleValues: m.workflowState.AgentMap,
+						resuming:   true,
+						workflowID: m.workflowState.WorkflowID,
+					}
+					m.pendingGenericWorkflowExtend = &genericWorkflowExtendState{
+						wizard: w, stageID: genericExhausted.StageID, maxIterations: genericExhausted.MaxIterations,
+					}
+					m.appendTranscript(fmt.Sprintf(
+						"%s workflow: stage %q exceeded %d iterations — continue with %d? [y/n] ",
+						milkTag(), genericExhausted.StageID, genericExhausted.MaxIterations, genericExhausted.MaxIterations*2,
+					))
+				} else {
+					m.appendTranscript(milkTag() + " workflow error: " + msg.Err.Error() + "\n")
+				}
+			} else {
+				m.appendTranscript(milkTag() + " workflow error: " + msg.Err.Error() + "\n")
+			}
+		} else {
+			m.appendTranscript(milkTag() + " workflow complete\n")
+		}
+		m.colorizeForce = true
+		m.refreshPrompt()
+		m.syncLayout()
+		return m, nil
+
+	case workflowResumeCheckMsg:
+		if msg.state != nil {
+			st := msg.state
+			m.workflowState = st
+			m.autoOpenPanel(regionWorkflow)
+			if st.Role != "done" {
+				m.appendTranscript(fmt.Sprintf(
+					"%s workflow %s in progress (sprint %d pass %d) — /workflow resume to continue, or ignore\n",
+					milkTag(), st.WorkflowName, st.Sprint, st.Pass,
+				))
+			}
+			m.syncLayout()
+		} else if msg.genericName != "" {
+			m.workflowState = &workflow.State{WorkflowName: msg.genericName, Task: msg.genericTask, Role: "interrupted"}
+			m.autoOpenPanel(regionWorkflow)
+			m.appendTranscript(fmt.Sprintf(
+				"%s workflow %s in progress (%s) — /workflow resume to continue, or ignore\n",
+				milkTag(), msg.genericName, msg.genericTask,
+			))
+			m.syncLayout()
+		}
+		return m, nil
+
+	case spinnerTickMsg:
+		if m.busy {
+			m.spinnerFrame++
+			m.flushViewportIfDirty()
+			return m, spinnerTick()
+		}
+		return m, nil
+
+	case copyFeedbackClearMsg:
+		m.copyFeedback = ""
+		return m, nil
+
+	case busyHintClearMsg:
+		m.busyHint = ""
+		return m, nil
+
+	case dragResetMsg:
+		if !m.dragResetPending {
+			return m, nil // already cancelled by a release event
+		}
+		m.dragResetPending = false
+		// The release was dropped — finalize any in-progress selection so the
+		// model state stays consistent, then reset the terminal to basic
+		// mouse tracking (mode 1000) where wheel-scroll works reliably.
+		if m.selAnchorLine >= 0 && m.selDragging && m.selText == "" {
+			m.selText = m.selectionText()
+		}
+		if m.panelSelAnchorLine >= 0 && m.panelSelDragging && m.panelSelText == "" {
+			m.panelSelText = panelSelectionText(m.panelSelLines(), m.panelSelAnchorLine, m.panelSelAnchorCol, m.panelSelEndLine, m.panelSelEndCol)
+		}
+		setMouseDragMode(false)
+		m.setViewportContent()
+		return m, nil
+
+	case credRefreshReadyMsg:
+		m.credRefreshing = false
+		m.credLabel = msg.label
+		if serverName, isMCPOAuth := strings.CutPrefix(msg.label, "MCP OAuth: "); isMCPOAuth {
+			if msg.err != nil {
+				m.credStatus = msg.err.Error()
+				m.credOK = false
+				m.appendTranscript(fmt.Sprintf("%s OAuth authorization for MCP server %q failed: %v\n", milkTag(), serverName, msg.err))
+			} else {
+				m.credStatus = "ok"
+				m.credOK = true
+				m.appendTranscript(fmt.Sprintf("%s OAuth authorization for MCP server %q completed — run /mcp reconnect %s to connect\n", milkTag(), serverName, serverName))
+			}
+			m.syncLayout()
+			return m, nil
+		}
+		if msg.err != nil {
+			m.credStatus = msg.err.Error()
+			m.credOK = false
+		} else {
+			m.credStatus = "ok"
+			m.credOK = true
+			if msg.creds != nil {
+				// AWS: apply fresh credentials and rebuild the local agent.
+				ac := activeLocalAgentConfig(m.st.cfg)
+				ac.AWSKeyID = msg.creds.AccessKeyID
+				ac.AWSSecret = msg.creds.SecretAccessKey
+				ac.AWSToken = msg.creds.SessionToken
+				newAgent := local.NewFromConfig(ac)
+				if od, err := config.OtelDir(); err == nil {
+					newAgent.WithOtelDir(od)
+				}
+				prog := m.st.program
+				newAgent.WithOnSigV4Refresh(func(err error) {
+					prog.Send(credRefreshReadyMsg{label: "AWS", err: err})
+				})
+				newAgent.WithLogContext(m.st.cfg.Otel.LogContext)
+				ist := m.st
+				newAgent.WithOnTokens(func(model, role string, prompt, completion, cacheRead, cacheCreation int64) {
+					ist.sess.AddTokensFull(model, role, prompt, completion, cacheRead, cacheCreation)
+				})
+				newAgent, mcpErr := attachMCPToolSet(m.ctx, m.st.cfg, activeLocalAgentConfig(m.st.cfg).Name, newAgent)
+				if mcpErr != nil {
+					m.appendTranscript(fmt.Sprintf("%s MCP reconnect error: %v\n", milkTag(), mcpErr))
+				}
+				m.agents.local = newAgent
+				m.agents.localAvail = newAgent.Ping(m.ctx) == nil
+				m.agents.primary = newLocalRunner(newAgent, activeLocalAgentConfig(m.st.cfg).Name)
+				m.rtr = router.New(m.st.cfg, newAgent)
+			}
+			// For token_cmd providers the transport already holds the token
+			// internally; no agent rebuild is needed.
+		}
+		return m, nil
+
+	case quitPendingClearMsg:
+		m.quitPending = false
+		return m, nil
+
+	case hintDebounceMsg:
+		if msg.gen == m.hintDebounceGen {
+			m.rebuildInlineHints()
+			m.syncLayout()
+		}
+		return m, nil
+
+	case memoryRefreshMsg:
+		if m.panelMemory {
+			return m, memoryPollTick()
+		}
+		return m, nil
+
+	case attachRefreshMsg:
+		if m.attached == nil {
+			return m, nil
+		}
+		m.syncAttachedContent()
+		return m, attachRefreshTick()
+
+	case taskStoreChangedMsg:
+		m.autoOpenPanel(regionTasks)
+		m.syncLayout()
+		return m, nil
+
+	case backgroundJobStartedMsg:
+		m.autoOpenPanel(regionBackground)
+		m.syncLayout()
+		return m, nil
+
+	case backgroundSpawnedMsg:
+		m.appendTranscript("\n" + dimWrap(fmt.Sprintf("⚙ spawned background agent %s (%q)", msg.jobID, msg.label)) + "\n")
+		m.autoOpenPanel(regionBackground)
+		m.syncLayout()
+		return m, nil
+
+	case backgroundJobDoneMsg:
+		j := msg.job
+		if j.Err != nil {
+			m.appendTranscript("\n" + dimWrap(fmt.Sprintf("⚙ background agent %q failed: %v", j.Label, j.Err)) + "\n")
+		} else {
+			m.appendTranscript("\n" + dimWrap(fmt.Sprintf("⚙ background agent %q completed", j.Label)) + "\n")
+		}
+		return m, nil
+
+	case backgroundBatchDoneMsg:
+		return m.maybeAutoFollowupBackgroundJobs(true)
+
+	case backgroundUserJobDoneMsg:
+		return m.maybeAutoFollowupBackgroundJobs(false)
+
+	case configReloadMsg:
+		if msg.err != nil {
+			m.appendTranscript(fmt.Sprintf("%s config reload error: %v\n", milkTag(), msg.err))
+			return m, nil
+		}
+		// Detect whether anything user-visible actually changed. Metadata-only
+		// writes (e.g. update_last_check saved on startup) must not show a banner
+		// that hides the splash screen.
+		oldCfg, newCfg := m.st.cfg, msg.cfg
+		oldCfg.UpdateLastCheck, newCfg.UpdateLastCheck = "", ""
+		oldCfg.UpdateSkippedVersion, newCfg.UpdateSkippedVersion = "", ""
+		contentChanged := !reflect.DeepEqual(oldCfg, newCfg)
+		m.st.cfg = msg.cfg
+		if contentChanged {
+			m.appendTranscript(milkTag() + " config reloaded\n")
+		}
+		m = m.refreshMCPToolSets()
+		return m, nil
+
+	case openFileMsg:
+		return m.handleOpenFileMsg(msg)
+
+	case updateAvailableMsg:
+		m.pendingUpdate = msg.release
+		// Record last-check time so we don't spam on every startup.
+		cfg := m.st.cfg
+		cfg.UpdateLastCheck = time.Now().UTC().Format(time.RFC3339)
+		_ = config.SaveScope(cfg, preferredSaveScope())
+		m.st.cfg = cfg
+		return m, nil
+
+	case updateProgressMsg:
+		m.updateProgress = msg.done
+		m.updateTotal = msg.total
+		return m, nil
+
+	case updateDoneMsg:
+		m.updateInstalling = false
+		m.updateProgress = 0
+		m.updateTotal = 0
+		if msg.err != nil {
+			m.appendTranscript(fmt.Sprintf("%s update failed: %v\n", milkTag(), msg.err))
+		} else {
+			m.pendingUpdate = nil
+			m.appendTranscript(milkTag() + " update applied — restart milk to use the new version\n")
+		}
+		return m, nil
+
+	case serverStartDoneMsg:
+		if msg.err != nil {
+			m.appendTranscript(fmt.Sprintf("%s server start failed: %v\n", milkTag(), msg.err))
+		} else if msg.pid != 0 {
+			m.appendTranscript(fmt.Sprintf("%s server for %q started  pid=%d  url=%s\n", milkTag(), msg.agentName, msg.pid, msg.url))
+		} else {
+			m.appendTranscript(fmt.Sprintf("%s server for %q started  url=%s\n", milkTag(), msg.agentName, msg.url))
+		}
+		return m, nil
+
+	case serverStopDoneMsg:
+		if msg.err != nil {
+			m.appendTranscript(fmt.Sprintf("%s server stop failed: %v\n", milkTag(), msg.err))
+		} else if msg.stopped {
+			m.appendTranscript(fmt.Sprintf("%s server for %q stopped\n", milkTag(), msg.agentName))
+		} else {
+			m.appendTranscript(fmt.Sprintf("%s no tracked server process for %q (not started by milk)\n", milkTag(), msg.agentName))
+		}
+		return m, nil
+
+	case errMsg:
+		m.appendTranscript(fmt.Sprintf("%s error: %v\n", milkTag(), msg.err))
+		return m, nil
+
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
+
+	}
+
+	// Pass remaining messages to viewport and textarea.
+	var cmds []tea.Cmd
+	var cmd tea.Cmd
+	m.vp, cmd = m.vp.Update(msg)
+	cmds = append(cmds, cmd)
+	cmd = m.updateTA(msg)
+	if _, isMouseMsg := msg.(tea.MouseMsg); !isMouseMsg {
+		m.syncLayout()
+	}
+	cmds = append(cmds, cmd)
+	return m, tea.Batch(cmds...)
+}
+
+func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Bracketed paste — let the textarea handle it directly.
+	// Pre-expand to terminal height so repositionView() inside ta.Update never
+	// scrolls on a large paste (updateTA's +1 is insufficient for multi-line pastes).
+	if msg.Paste {
+		// Check whether the pasted content looks like a file path that exists.
+		// If so, ask the user whether to attach it rather than insert it as text.
+		pasted := strings.TrimSpace(string(msg.Runes))
+		if isLikelyFilePath(pasted) {
+			clean := unquoteFilePath(pasted)
+			m.pendingPathPaste = clean
+			m.appendTranscript(fmt.Sprintf("%s pasted path %q — attach as file? [Y/n] ", milkTag(), clean))
+			m.syncLayout()
+			return m, nil
+		}
+		// Path-like string that doesn't exist on disk (e.g. Windows UNC path
+		// or a path to a remote file): insert as @path so the agent sees it.
+		if looksLikeFilePath(pasted) {
+			m.ta.InsertString("@" + unquoteFilePath(pasted))
+			m.syncLayout()
+			return m, nil
+		}
+		// Empty paste: the clipboard may hold binary/non-text content that the
+		// terminal couldn't relay. Probe via xclip/wl-paste asynchronously.
+		if pasted == "" {
+			return m, m.probeClipboardCmd()
+		}
+		// The paste lands at the very start of the buffer: the leading token
+		// (what extractSlashCommand/stripBangPrefix/shelldetect inspect) is
+		// about to become pasted content rather than typed content.
+		if m.taCursorOffset() == 0 {
+			m.leadingPasted = true
+		}
+		m.undoPush(false) // paste is always its own undo step; updateTA will skip (same value)
+		m.ta.SetHeight(m.height)
+		var cmd tea.Cmd
+		cmd = m.updateTA(msg)
+		m.syncLayout()
+		return m, cmd
+	}
+
+	// Any key other than ctrl+c cancels a pending quit confirmation.
+	if m.quitPending && msg.String() != "ctrl+c" {
+		m.quitPending = false
+	}
+
+	// ctrl+r search mode: intercept most keys.
+	if m.searching {
+		return m.handleSearchKey(msg)
+	}
+
+	// "!" as the first character of an empty textarea enters bang mode:
+	// consume the leading "!" (don't insert it) and switch the prompt label.
+	// Checked against msg.Runes rather than msg.String() == "!" because fast
+	// typing (or scripted input) can deliver several characters in a single
+	// KeyMsg — e.g. "!echo hi" arriving as one tea.KeyRunes burst — and a
+	// plain string match on "!" alone would miss that and insert it literally.
+	if !m.bangMode && m.ta.Value() == "" && msg.Type == tea.KeyRunes && len(msg.Runes) > 0 && msg.Runes[0] == '!' {
+		m.bangMode = true
+		if rest := string(msg.Runes[1:]); rest != "" {
+			m.ta.InsertString(rest)
+		}
+		m.refreshPrompt()
+		m.syncLayout()
+		return m, nil
+	}
+
+	switch msg.String() {
+	case "backspace":
+		// Backspacing an empty buffer while in bang mode exits the mode
+		// instead of being a no-op.
+		if m.bangMode && m.ta.Value() == "" {
+			m.bangMode = false
+			m.refreshPrompt()
+			return m, nil
+		}
+	case "ctrl+z":
+		undoDebugLog("KEY ctrl+z val=%q undoStack=%d redoStack=%d lastUndoValue=%q", m.ta.Value(), len(m.undoStack), len(m.redoStack), m.lastUndoValue)
+		if m.undoApply(&m.undoStack, &m.redoStack) {
+			m.syncLayout()
+		}
+		return m, nil
+	case "ctrl+y":
+		undoDebugLog("KEY ctrl+y val=%q undoStack=%d redoStack=%d lastUndoValue=%q", m.ta.Value(), len(m.undoStack), len(m.redoStack), m.lastUndoValue)
+		if m.undoApply(&m.redoStack, &m.undoStack) {
+			m.syncLayout()
+		}
+		return m, nil
+	case "esc":
+		if m.taSelAnchor >= 0 {
+			m.taClearSel()
+			m.setViewportContent()
+			return m, nil
+		}
+		if m.selAnchorLine >= 0 {
+			m.clearSelection()
+			m.setViewportContent()
+			return m, nil
+		}
+		if m.panelSelAnchorLine >= 0 {
+			m.clearPanelSelection()
+			return m, nil
+		}
+	case "ctrl+c":
+		return m.handleCtrlC()
+	case "ctrl+d":
+		if m.ta.Value() == "" {
+			return m, tea.Quit
+		}
+	case "ctrl+r":
+		m.searching = true
+		m.searchForward = false
+		m.searchQuery.Reset()
+		m.searchIdx = -1
+		m.refreshPrompt()
+		m.syncLayout()
+		return m, nil
+	case "ctrl+s":
+		m.searching = true
+		m.searchForward = true
+		m.searchQuery.Reset()
+		m.searchIdx = -1
+		m.refreshPrompt()
+		m.syncLayout()
+		return m, nil
+	case "enter":
+		if len(m.tabMatches) > 0 {
+			// Tab cycling is active: accept the already-inserted completion.
+			// If the inserted sig has a parameter placeholder, position the cursor
+			// there and clear the placeholder so the user can type the value directly.
+			current := m.ta.Value()
+			m.tabMatches = nil
+			m.tabIdx = -1
+			m.tabCmdIdx = 0
+			m.tabVarIdx = 0
+			m.tabBeforeCursor = ""
+			m.tabAfterCursor = ""
+			m.tabPrefix = ""
+			m.tabSubcmdMode = false
+			m.tabHints = nil
+			m.tabHintsBase = nil
+			m.hintIdx = -1
+			if cleared, pos := clearFirstPlaceholder(current); pos >= 0 {
+				m.ta.SetValue(cleared)
+				m.ta.SetCursor(pos)
+				m.rebuildInlineHints()
+			}
+			m.syncLayout()
+			return m, nil
+		}
+		if m.hintIdx >= 0 {
+			if m.commitHintSelection() {
+				// Same: position cursor at first placeholder if present.
+				if cleared, pos := clearFirstPlaceholder(m.ta.Value()); pos >= 0 {
+					m.ta.SetValue(cleared)
+					m.ta.SetCursor(pos)
+					m.rebuildInlineHints()
+				}
+				m.syncLayout()
+				return m, nil
+			}
+			m.hintIdx = -1
+		}
+		return m.handleEnter()
+	case "up":
+		if len(m.tabHints) > 0 {
+			m.hintIdx--
+			if m.hintIdx < 0 {
+				m.hintIdx = len(m.tabHints) - 1
+			}
+			if len(m.tabMatches) > 0 {
+				m.syncTabIdxFromHint()
+				m = m.insertActiveCompletion()
+			}
+			m.highlightHint()
+			m.syncLayout()
+			return m, nil
+		}
+		li := m.ta.LineInfo()
+		if m.ta.Line() == 0 && li.RowOffset == 0 {
+			m = m.historyBack()
+			m.syncLayout()
+			return m, nil
+		}
+	case "down":
+		if len(m.tabHints) > 0 {
+			m.hintIdx++
+			if m.hintIdx >= len(m.tabHints) {
+				m.hintIdx = 0
+			}
+			if len(m.tabMatches) > 0 {
+				m.syncTabIdxFromHint()
+				m = m.insertActiveCompletion()
+			}
+			m.highlightHint()
+			m.syncLayout()
+			return m, nil
+		}
+		li := m.ta.LineInfo()
+		if m.ta.Line() == m.ta.LineCount()-1 && li.RowOffset == li.Height-1 {
+			m = m.historyForward()
+			m.syncLayout()
+			return m, nil
+		}
+	case "ctrl+up":
+		if m.selAnchorLine >= 0 {
+			return m.extendTranscriptSel(msg)
+		}
+		m = m.historyBack()
+		m.syncLayout()
+		return m, nil
+	case "ctrl+down":
+		if m.selAnchorLine >= 0 {
+			return m.extendTranscriptSel(msg)
+		}
+		m = m.historyForward()
+		m.syncLayout()
+		return m, nil
+	case "ctrl+left", "ctrl+right":
+		if m.selAnchorLine >= 0 {
+			return m.extendTranscriptSel(msg)
+		}
+	case "shift+left", "shift+right", "shift+up", "shift+down", "shift+home", "shift+end",
+		"shift+ctrl+left", "shift+ctrl+right", "shift+alt+left", "shift+alt+right",
+		"ctrl+shift+left", "ctrl+shift+right":
+		if m.selAnchorLine >= 0 {
+			return m.extendTranscriptSel(msg)
+		}
+		return m.handleShiftArrow(msg)
+	case "tab":
+		if m.hintIdx >= 0 && len(m.tabMatches) == 0 {
+			m.commitHintSelection()
+			m.syncLayout()
+			return m, nil
+		}
+		m = m.handleTab(1)
+		m.syncLayout()
+		return m, nil
+	case "shift+tab":
+		m = m.handleTab(-1)
+		m.syncLayout()
+		return m, nil
+	case "ctrl+t":
+		m = m.toggleThinking()
+		return m, nil
+	case "pgup", "ctrl+u":
+		m.vp.HalfPageUp()
+		return m, nil
+	case "pgdown", "ctrl+f":
+		m.vp.HalfPageDown()
+		return m, nil
+	}
+
+	// Non-Tab key resets tab cycling
+	m.tabMatches = nil
+	m.tabIdx = -1
+	m.tabCmdIdx = 0
+	m.tabVarIdx = 0
+	m.tabBeforeCursor = ""
+	m.tabAfterCursor = ""
+	m.tabPrefix = ""
+	m.tabSubcmdMode = false
+	m.tabHints = nil
+	m.tabHintsBase = nil
+
+	// When a keyboard selection is active, special keys act on it.
+	if m.taSelText() != "" {
+		switch msg.String() {
+		case "ctrl+x":
+			// Cut: copy then delete.
+			t := m.taSelText()
+			copyToClipboard(t)
+			m.copyFeedback = fmt.Sprintf("copied %d chars", len([]rune(t)))
+			m = m.taDeleteSelection()
+			m.syncLayout()
+			return m, copyFeedbackClearCmd()
+		case "backspace", "delete", "ctrl+h":
+			// Delete selection without copying.
+			m = m.taDeleteSelection()
+			m.syncLayout()
+			return m, nil
+		default:
+			// Any printable key replaces the selection.
+			if len(msg.Runes) > 0 || msg.Type == tea.KeySpace {
+				m = m.taDeleteSelection()
+				// Fall through to let the textarea insert the typed key.
+			}
+		}
+	}
+
+	// Any non-shift key clears the keyboard selection.
+	m.taClearSel()
+
+	var cmd tea.Cmd
+	m.undoPush(true)
+	cmd = m.updateTA(msg)
+	// Buffer emptied out (e.g. backspacing away a paste): nothing pasted
+	// remains, so any further typing starts a clean, untainted leading token.
+	if m.ta.Value() == "" {
+		m.leadingPasted = false
+	}
+	m.syncLayout()
+	return m, tea.Batch(cmd, m.scheduleHintRebuild())
+}
+
+// handleShiftArrow manages keyboard selection in the input textarea.
+// Shift+Arrow keys extend the selection; the anchor is set on the first shift press.
+// The bare direction key is forwarded to the textarea to move the cursor.
+func (m model) handleShiftArrow(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Set anchor at current cursor position before moving.
+	if m.taSelAnchor < 0 {
+		m.taSelAnchor = m.taCursorOffset()
+	}
+
+	// Map shift+arrow → bare direction for the textarea.
+	var bareKey tea.KeyMsg
+	switch msg.String() {
+	case "shift+left":
+		bareKey = tea.KeyMsg{Type: tea.KeyLeft}
+	case "shift+right":
+		bareKey = tea.KeyMsg{Type: tea.KeyRight}
+	case "shift+up":
+		bareKey = tea.KeyMsg{Type: tea.KeyUp}
+	case "shift+down":
+		bareKey = tea.KeyMsg{Type: tea.KeyDown}
+	case "shift+home":
+		bareKey = tea.KeyMsg{Type: tea.KeyHome}
+	case "shift+end":
+		bareKey = tea.KeyMsg{Type: tea.KeyEnd}
+	case "shift+ctrl+left", "shift+alt+left", "ctrl+shift+left":
+		bareKey = tea.KeyMsg{Type: tea.KeyLeft, Alt: true}
+	case "shift+ctrl+right", "shift+alt+right", "ctrl+shift+right":
+		bareKey = tea.KeyMsg{Type: tea.KeyRight, Alt: true}
+	default:
+		bareKey = tea.KeyMsg{Type: tea.KeyRight}
+	}
+
+	cmd := m.updateTA(bareKey)
+	m.taSelEnd = m.taCursorOffset()
+	m.syncLayout()
+	return m, cmd
+}
+
+// extendTranscriptSel extends or reduces the current transcript selection using
+// Shift+Arrow keys. The anchor stays fixed; only selEndLine/selEndCol moves.
+func (m model) extendTranscriptSel(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	lines := m.transcriptPlainLines()
+	maxLine := len(lines) - 1
+
+	endLine := m.selEndLine
+	endCol := m.selEndCol
+	if endLine < 0 {
+		// Selection was set via mouse-press only (no drag yet): start end at anchor.
+		endLine = m.selAnchorLine
+		endCol = m.selAnchorCol
+	}
+
+	lineLen := func(l int) int {
+		if l < 0 || l > maxLine {
+			return 0
+		}
+		return len([]rune(lines[l]))
+	}
+
+	switch msg.String() {
+	case "shift+up", "ctrl+up":
+		endLine--
+	case "shift+down", "ctrl+down":
+		endLine++
+	case "shift+left", "ctrl+left":
+		if endCol > 0 {
+			endCol--
+		} else if endLine > 0 {
+			endLine--
+			endCol = lineLen(endLine)
+		}
+	case "shift+right", "ctrl+right":
+		ll := lineLen(endLine)
+		if endCol < ll {
+			endCol++
+		} else if endLine < maxLine {
+			endLine++
+			endCol = 0
+		}
+	case "shift+home":
+		endCol = 0
+	case "shift+end":
+		endCol = lineLen(endLine)
+	}
+
+	if endLine < 0 {
+		endLine = 0
+	}
+	if endLine > maxLine {
+		endLine = maxLine
+	}
+	ll := lineLen(endLine)
+	if endCol < 0 {
+		endCol = 0
+	}
+	if endCol > ll {
+		endCol = ll
+	}
+
+	m.selEndLine = endLine
+	m.selEndCol = endCol
+	m.selText = m.selectionText()
+
+	if m.ready {
+		// Scroll the viewport to keep the moving end of the selection visible.
+		visible0 := m.vp.YOffset
+		visible1 := m.vp.YOffset + m.vp.Height - 1
+		if endLine < visible0 {
+			m.vp.SetYOffset(endLine)
+		} else if endLine > visible1 {
+			m.vp.SetYOffset(endLine - m.vp.Height + 1)
+		}
+		m.setViewportContent()
+	}
+	return m, nil
+}
+
+func (m model) handleCtrlC() (tea.Model, tea.Cmd) {
+	if m.selText != "" {
+		copyToClipboard(m.selText)
+		m.copyFeedback = fmt.Sprintf("copied %d chars", len([]rune(m.selText)))
+		m.clearSelection()
+		m.setViewportContent()
+		return m, copyFeedbackClearCmd()
+	}
+	if m.panelSelText != "" {
+		copyToClipboard(m.panelSelText)
+		m.copyFeedback = fmt.Sprintf("copied %d chars", len([]rune(m.panelSelText)))
+		m.clearPanelSelection()
+		return m, copyFeedbackClearCmd()
+	}
+	if t := m.taSelText(); t != "" {
+		copyToClipboard(t)
+		m.copyFeedback = fmt.Sprintf("copied %d chars", len([]rune(t)))
+		m.taClearSel()
+		m.setViewportContent()
+		return m, copyFeedbackClearCmd()
+	}
+	if m.bangMode || m.ta.Value() != "" {
+		m.ta.Reset()
+		m.bangMode = false
+		m.leadingPasted = false
+
+		m.tabMatches = nil
+		m.tabIdx = -1
+		m.tabCmdIdx = 0
+		m.tabVarIdx = 0
+		m.tabBeforeCursor = ""
+		m.tabAfterCursor = ""
+		m.tabPrefix = ""
+		m.tabSubcmdMode = false
+		m.tabHints = nil
+		m.tabHintsBase = nil
+		m.refreshPrompt()
+		m.syncLayout()
+		return m, nil
+	}
+	// If designer questions are pending, Ctrl+C cancels the workflow.
+	if m.pendingWorkflowQuestions != "" {
+		m.pendingWorkflowQuestions = ""
+		m.workflowAnswersCh = nil
+		if m.cancelTurn != nil {
+			m.cancelTurn()
+			m.cancelTurn = nil
+		}
+		m.appendTranscript("\n" + milkTag() + " workflow cancelled\n")
+		m.refreshPrompt()
+		m.syncLayout()
+		return m, nil
+	}
+	if m.quitPending {
+		return m, tea.Quit
+	}
+	m.quitPending = true
+	return m, quitPendingClearCmd()
+}
+
+func (m model) handleEnter() (tea.Model, tea.Cmd) {
+	input := strings.TrimSpace(stripCompletionPlaceholders(m.ta.Value()))
+	// Bang mode consumed the "!" at keystroke time so it never lived in the
+	// textarea; re-prepend it here so submitInput's stripBangPrefix still
+	// recognizes this as a direct-execution command.
+	if m.bangMode {
+		input = "!" + input
+		m.bangMode = false
+		m.refreshPrompt()
+	}
+	m.ta.Reset()
+
+	m.tabMatches = nil
+	m.tabIdx = -1
+	m.tabCmdIdx = 0
+	m.tabVarIdx = 0
+	m.tabBeforeCursor = ""
+	m.tabAfterCursor = ""
+	m.tabPrefix = ""
+	m.tabSubcmdMode = false
+	m.tabHints = nil
+	m.tabHintsBase = nil
+	m.syncLayout()
+	m.histIdx = -1
+	m.saved = ""
+
+	// If we're collecting designer disambiguation answers, send them to the workflow.
+	if m.pendingWorkflowQuestions != "" {
+		// This branch never reaches submitInput (the one place that normally
+		// consumes and clears leadingPasted), so clear it here.
+		m.leadingPasted = false
+		// Don't send empty answers — they create empty checkpoint entries
+		// that replay badly on resume.  Treat bare Enter as "continue".
+		answer := input
+		if strings.TrimSpace(answer) == "" {
+			answer = "continue"
+		}
+		m.appendTranscript(promptLabel(m.st) + answer + "\n")
+		if m.workflowAnswersCh != nil {
+			m.workflowAnswersCh <- answer
+			// Don't close the channel — it's reused for subsequent
+			// user_checkpoint stages in the same workflow run.
+			m.workflowAnswersCh = nil
+		}
+		m.pendingWorkflowQuestions = ""
+		// Re-lock input while the designer finalizes the plan.
+		m.busy = true
+		m.spinnerFrame = 0
+		m.lastWorkflowActivity = time.Now()
+		m.workflowTimeoutWarned = false
+		if m.workflowState != nil {
+			// Keep Role as the canonical "designer" (matches AgentMap's key) so
+			// the idle watchdog can still resolve the agent's turn timeout.
+			m.workflowState.Role = "designer"
+		}
+		m.appendTranscript(milkTag() + " Answers submitted. Designer finalizing plan...\n")
+		m.syncLayout()
+		return m, tea.Batch(spinnerTick(), workflowIdleCheck())
+	}
+
+	return m.submitInput(input, promptLabel(m.st))
+}
+
+// backgroundFollowupPrompt is the synthetic input used to trigger a real
+// follow-up turn once a whole wave of spawn_background_agent jobs has
+// finished (ADR-0043). It carries no content of its own — drainBackgroundJobs
+// (dispatch.go) prepends the actual drained results to whatever turn picks
+// it up; this text only needs to point the model at reacting to them.
+//
+// Aliases local.BackgroundFollowupPrompt rather than defining its own text:
+// Run's isRepeatedPrompt whitelist exempts that exact string from the
+// repeated-prompt escalation signal (a fixed synthetic prompt recurring
+// across multiple completed waves looks identical to a human repeating
+// themselves out of frustration, and would otherwise trigger a bogus
+// self-escalation). Defining a second, textually-identical constant here
+// would risk the two drifting apart if either ever gets edited alone.
+const backgroundFollowupPrompt = local.BackgroundFollowupPrompt
+
+// spawnUserBackgroundAgent spawns a background research job (ADR-0043) from
+// text the user typed while the model was busy — Ctrl+Enter (or Ctrl+J) while
+// busy with text in the input (see handleBusyKey). Unlike an
+// agent-initiated spawn_background_agent tool call, there is no
+// requirement that the currently-busy role itself be local-backed (the
+// in-flight turn could be running on claude-cli, which has no Manager at
+// all) — the job just needs any inference-server-backed agent to fork from,
+// so this prefers the escalation agent's local backend (generally the more
+// capable one) and falls back to primary's.
+func (m model) spawnUserBackgroundAgent(task string) (tea.Model, tea.Cmd) {
+	m.ta.Reset()
+	m.leadingPasted = false
+	m.busyHint = ""
+	m.syncLayout()
+
+	mgr := m.agents.backgroundMgr
+	agent := m.agents.escalationLocal
+	modelName := m.st.cfg.EscalationAgentConfig().Model
+	if modelName == "" {
+		modelName = m.st.cfg.EscalationAgentConfig().Name
+	}
+	if agent == nil {
+		agent = m.agents.local
+		modelName = m.st.cfg.ActiveAgent().Model
+		if modelName == "" {
+			modelName = m.st.cfg.ActiveAgent().Name
+		}
+	}
+	if mgr == nil || agent == nil {
+		m.appendTranscript("\n" + dimWrap("⚙ background agent unavailable — no inference-server-backed agent configured") + "\n")
+		return m, nil
+	}
+
+	label := task
+	if len(label) > 60 {
+		label = label[:57] + "..."
+	}
+	cwd := m.st.cwd
+	// Perform the spawn inside a tea.Cmd so that the Manager's onStart
+	// callback (which calls p.Send on bubbletea's unbuffered msgs channel)
+	// runs outside the current Update() call — calling p.Send from within
+	// Update deadlocks because the event loop goroutine is the only reader
+	// of that channel and it is blocked waiting for Update to return.
+	return m, func() tea.Msg {
+		job := mgr.Spawn(label, task, "user", modelName, func(ctx context.Context, jobID string, out io.Writer) (string, session.TokenUsage, error) {
+			return agent.RunBackgroundTask(ctx, jobID, cwd, task, "", out)
+		})
+		return backgroundSpawnedMsg{jobID: job.ID, label: label}
+	}
+}
+
+// maybeAutoFollowupBackgroundJobs delivers currently-drainable
+// spawn_background_agent results as a real follow-up turn once the TUI is
+// idle, so the agent actually produces the consolidated response it usually
+// promises — rather than leaving results sitting in the Manager's queue
+// until the user happens to send another message.
+//
+// waitForWholeWave distinguishes the two callers:
+//   - true (agent-initiated, via the spawn_background_agent tool call and
+//     backgroundBatchDoneMsg): the calling agent designed a consolidated,
+//     multi-part wave meant to be reported together, so this only fires
+//     once every currently-outstanding job has finished (ActiveCount == 0).
+//   - false (user-initiated, via the busy-key "Ctrl+Enter to spawn"
+//     flow and backgroundUserJobDoneMsg): there is no "wave" to
+//     consolidate — the user forked off one specific side-question while
+//     waiting on something else, so this fires as soon as the model is
+//     idle regardless of whether other jobs (agent- or user-initiated) are
+//     still running. Delivering it promptly matters more than batching it
+//     with unrelated work the user never asked this request to wait for.
+//
+// Called both when a job/wave first finishes and again after any turn
+// completes (handleAgentDone), in case it finished while busy.
+func (m model) maybeAutoFollowupBackgroundJobs(waitForWholeWave bool) (tea.Model, tea.Cmd) {
+	mgr := m.agents.backgroundMgr
+	if mgr == nil {
+		m.pendingBackgroundFollowup = false
+		m.pendingUserBackgroundFollowup = false
+		return m, nil
+	}
+	if waitForWholeWave && mgr.ActiveCount() > 0 {
+		// A newer wave started in the meantime — wait for that wave's own
+		// completion signal instead.
+		m.pendingBackgroundFollowup = false
+		return m, nil
+	}
+	if m.busy || m.pendingPerm != nil || m.pendingDirectBash != nil || m.ptyPane != nil {
+		if waitForWholeWave {
+			m.pendingBackgroundFollowup = true
+		} else {
+			m.pendingUserBackgroundFollowup = true
+		}
+		return m, nil
+	}
+	m.pendingBackgroundFollowup = false
+	m.pendingUserBackgroundFollowup = false
+	return m.submitInput(backgroundFollowupPrompt, dim("[background]")+" ")
+}
+
+// submitInput handles a finalised user input string from any source (keyboard,
+// Telegram, etc.). label is the transcript echo prefix.
+func (m model) submitInput(input, label string) (tea.Model, tea.Cmd) {
+	if input == "" {
+		return m, nil
+	}
+
+	// Snapshot and clear: this input cycle's provenance is fully consumed by
+	// the gate below, and the field must not leak into whatever the caller
+	// (e.g. handleEnter, which resets the textarea before calling submitInput)
+	// puts in the buffer next.
+	leadingPasted := m.leadingPasted
+	m.leadingPasted = false
+
+	// Feed user turn to loop detector (resets turn-flood streak).
+	if m.loopDetector != nil {
+		m.loopDetector.Feed(loop.TurnSummary{
+			Text:       input,
+			Timestamp:  time.Now(),
+			IsUserTurn: true,
+		})
+		m.loopInterrupt = false
+		m.loopWarning = ""
+	}
+
+	m.appendTranscript(label + colorizeTokens(input) + "\n")
+
+	// Append to both histories (deduped)
+	m.sessionHistory = appendDeduped(m.sessionHistory, input, maxPersistedHistory)
+	m.globalHistory = appendDeduped(m.globalHistory, input, maxPersistedHistory)
+
+	// All command/bang/direct-bash triggers below are gated on !leadingPasted:
+	// if the leading content of this input arrived via a real paste event
+	// rather than being typed, it's treated as inert prompt text (issue #151) —
+	// a pasted transcript that happens to start with "/learn" or "!rm -rf" must
+	// not execute anything.
+	if !leadingPasted {
+		if input == cmdPaste {
+			// /paste is also the manual trigger for clipboard binary attachment:
+			// terminals (especially Windows Terminal / WSL2) never send a bracketed-paste
+			// event when the clipboard holds only binary data (image, PDF, etc.), so the
+			// automatic empty-paste hook cannot fire. /paste covers that gap.
+			return m, m.probeClipboardCmd()
+		}
+
+		// "!" prefix: explicit direct-execution mode (Claude Code style). Always
+		// available regardless of the direct_bash config, and skips confirmation —
+		// the leading "!" is itself an unambiguous request to run a shell command.
+		if shellCmd, ok := stripBangPrefix(input); ok {
+			if shellCmd == "" {
+				return m, nil
+			}
+			return m.launchPTYPane(shellCmd)
+		}
+
+		if cmd, rest, found := extractSlashCommand(input); found {
+			return m.handleSlashInput(cmd, rest)
+		}
+
+		// Direct-bash shortcut: if enabled and input looks like a shell command,
+		// ask for confirmation before running it locally (or run immediately if
+		// the first token is in the allow-list).
+		if m.st.cfg.DirectBash {
+			if shellCmd, ok := shelldetect.IsShellCommand(input); ok {
+				if shelldetect.HasAllowedPrefix(shellCmd, m.st.cfg.DirectBashAllow) {
+					return m.launchPTYPane(shellCmd)
+				}
+				// Show confirmation prompt.
+				cmd := shellCmd
+				m.pendingDirectBash = &cmd
+				m.appendTranscript(milkTag() + " run: " + bold(shellCmd) + "  [Y/n] ")
+				m.refreshPrompt()
+				return m, nil
+			}
+		}
+	}
+
+	return m.dispatchAgent(input)
+}
+
+func (m model) dispatchAgent(input string) (tea.Model, tea.Cmd) {
+	m.busy = true
+	m.spinnerFrame = 0
+	m.currentTurnChars = 0
+	m.currentTurnInputChars = 0
+	m.currentTurnThinking.Reset()
+	m.thinkingActiveInTurn = false
+	m.loopInterrupt = false
+	m.loopWarning = ""
+	if m.loopDetector != nil {
+		m.loopDetector.ResetTurn()
+	}
+
+	// Apply pending attachments.
+	// Text attachments: prepend context blocks to the agent prompt.
+	// Image attachments: set ContentParts on the local agent for multipart vision payload;
+	//   also inject data-URI blocks into the prompt for the CLI escalation path.
+	// Session history uses the original input plus compact [attached: name] placeholders.
+	attachments := m.pendingAttachments
+	m.pendingAttachments = nil // clear before dispatch
+
+	// agentInput: what gets sent to the agent (may include full attachment content).
+	// st.pendingSessionContent: compact version stored in session history (placeholders).
+	agentInput := input
+	var imageParts []local.ContentPart
+	if len(attachments) > 0 {
+		var textBlocks strings.Builder
+		var imgBlocks strings.Builder
+		var ph strings.Builder
+		for _, a := range attachments {
+			fmt.Fprintf(&ph, " %s", attachmentPlaceholder(a))
+			if a.isImage() {
+				// Local-provider agent (primary and/or escalation): multipart
+				// image_url content part (base64 data URI) — wired below into
+				// whichever *local.Agent(s) are set. A local escalation agent
+				// used to only get this same image dumped as a raw base64 text
+				// blob (see the removed inline-text branch this replaced) —
+				// which it can't actually see as an image, so it confabulated
+				// a plausible-sounding description instead of reading it.
+				imageParts = append(imageParts, local.ContentPart{
+					Type:     "image_url",
+					ImageURL: &local.ImageURLPart{URL: attachmentDataURI(a)},
+				})
+				if m.agents.escalation != nil && m.agents.escalation.IsCLI() {
+					// CLI escalation path: write image to temp file, inject @path reference.
+					// The claude binary reads @path natively — no base64 in the prompt needed.
+					ext := mimeExtension(a.MIMEType)
+					written := false
+					if f, err := os.CreateTemp("", "milk-img-*"+ext); err == nil {
+						if _, werr := f.Write(a.Data); werr == nil {
+							f.Close()
+							m.st.pendingCLIImageFiles = append(m.st.pendingCLIImageFiles, f.Name())
+							fmt.Fprintf(&imgBlocks, "@%s\n", f.Name())
+							written = true
+						} else {
+							f.Close()
+							os.Remove(f.Name())
+						}
+					}
+					if !written {
+						fmt.Fprintf(&imgBlocks, "[attached image: %s]\n%s\n\n", a.Name, attachmentDataURI(a))
+					}
+				}
+			} else {
+				textBlocks.WriteString(attachmentContextBlock(a))
+			}
+		}
+		var sb strings.Builder
+		if textBlocks.Len() > 0 {
+			sb.WriteString(textBlocks.String())
+			sb.WriteByte('\n')
+		}
+		if imgBlocks.Len() > 0 {
+			sb.WriteString(imgBlocks.String())
+		}
+		sb.WriteString(input)
+		agentInput = sb.String()
+		obs.Debug("dispatch: agentInput prefix", "agentInput[:100]", func() string {
+			if len(agentInput) > 100 {
+				return agentInput[:100]
+			}
+			return agentInput
+		}())
+		// Record compact form in session history (no full file data).
+		m.st.pendingSessionContent = input + ph.String()
+	}
+
+	m.pendingForceFresh = m.st.sess.ForceFreshEscalation
+
+	turnCtx, cancel := context.WithCancel(m.ctx)
+	m.cancelTurn = cancel
+
+	st := m.st
+	rtr := m.rtr
+	send := func(msg tea.Msg) { st.program.Send(msg) }
+	st.toolFutures = map[string]chan string{}
+
+	ir0 := &tuiInputReader{send: send}
+	tuiAgents, _ := m.buildTUIAgents(send, ir0)
+
+	// Wire image parts into both local agents so whichever one the router picks
+	// this turn sends a multipart vision payload — routing isn't decided until
+	// runTurn below, and only escalationLocal's own pendingImageParts (not
+	// primary's) reaches a local escalation agent's Run() call.
+	if len(imageParts) > 0 {
+		if tuiAgents.local != nil {
+			tuiAgents.local.SetPendingImageParts(imageParts)
+		}
+		if tuiAgents.escalationLocal != nil {
+			tuiAgents.escalationLocal.SetPendingImageParts(imageParts)
+		}
+	}
+
+	// Capture input chars for the live token estimate in the status bar.
+	m.currentTurnInputChars = int64(len(agentInput))
+
+	return m, tea.Batch(
+		spinnerTick(),
+		func() tea.Msg {
+			defer cancel()
+			sw := &sendWriter{send: send}
+			err := runTurn(turnCtx, st, rtr, &tuiAgents, agentInput, sw, ir0)
+			return agentDoneMsg{err: err}
+		},
+	)
+}
+
+// buildTUIAgents wires the live TUI callbacks (permission handlers, tool-use
+// hints, thinking, skip-permissions) into a fresh copy of m.agents and returns
+// it alongside the permContext built for the CLI escalation runner.
+// Called by both dispatchAgent (for normal turns) and launchWorkflow (so that
+// workflow roles get the same tool access and permission flow as regular turns).
+func (m model) buildTUIAgents(send func(tea.Msg), ir0 *tuiInputReader) (dispatchAgents, permContext) {
+	st := m.st
+	agents := m.agents
+	termWidth := m.width
+
+	tuiAgents := agents
+	var cliPC permContext
+	if agents.cliAgent != nil {
+		tuiCliAgent := agents.cliAgent.
+			WithSkipPermissions(st.skipPermissions).
+			WithOAuthRequiredHandler(func(serverName, authURL string) {
+				send(oauthRequiredMsg{serverName: serverName, authURL: authURL})
+			}).
+			WithOnToolUse(func(name string) {
+				send(toolUseMsg{name: name})
+			}).
+			WithOnToolUseReady(func(name string, input map[string]any) {
+				// AskUserQuestion is handled entirely by milk's selection prompt —
+				// suppress the ⚙ hint here to keep the transcript clean.
+				if name == "AskUserQuestion" {
+					return
+				}
+				var hint string
+				summary := truncateToolSummary(name, cliToolArgSummary(input), termWidth)
+				if summary != "" {
+					hint = "\n" + dimWrap("⚙ "+name+": "+summary) + "\n"
+				} else {
+					hint = "\n" + dimWrap("⚙ "+name) + "\n"
+				}
+				if st.cfg.RemoteOversight.NotifyToolsEnabled() {
+					st.notifier.NotifyToolUse(context.Background(), name, cliToolArgSummary(input))
+				}
+				if d := cliToolDiff(name, input); d != "" {
+					hint += d
+				}
+				send(chunkMsg{text: hint})
+			}).
+			WithOnToolResult(func(name, result string, isError bool) {
+				if st.cfg.RemoteOversight.NotifyToolsEnabled() {
+					st.notifier.NotifyToolResult(context.Background(), name, result, isError)
+				}
+			}).
+			WithOnThinking(func(text string) { send(thinkChunkMsg{text: text}) }).
+			WithPermissionHandler(makeTUIPermissionHandler(ir0, st.cs, st.notifier))
+		tuiAgents.cliAgent = tuiCliAgent
+		cliPC = permContext{cs: st.cs, cwd: st.cwd, toolFutures: st.toolFutures, contextHash: &st.lastEscalationContextHash}
+		// Only rebuild escalation runner as cliRunner when cliAgent IS the escalation target.
+		if agents.escalationLocal == nil && agents.subprocessAgent == nil {
+			escName := agents.escalation.Name()
+			cr := newCLIRunner(tuiCliAgent, escName, cliPC, func() inputReader { return ir0 })
+			if servers := st.cfg.EffectiveMCPServers(escName); len(servers) > 0 {
+				cr = cr.withMCPServers(servers)
+			}
+			tuiAgents.escalation = cr
+		}
+	}
+
+	// Wire local-agent permissions: persistent store + TUI ask callback.
+	// Both the primary and escalation-local agents share the same store and ask
+	// callback — they operate in the same cwd and grants should be shared.
+	localPermStore := st.localPerms
+	localPermAsk := makeLocalPermAsk(ir0, localPermStore)
+	localOpenFile := func(path string) error {
+		respCh := make(chan error, 1)
+		send(openFileMsg{path: path, respCh: respCh})
+		return <-respCh
+	}
+	localOnToolUse := func(name, summary string) {
+		if st.cfg.RemoteOversight.NotifyToolsEnabled() {
+			st.notifier.NotifyToolUse(context.Background(), name, summary)
+		}
+	}
+	localOnToolResult := func(name, result string) {
+		if st.cfg.RemoteOversight.NotifyToolsEnabled() {
+			// toolResult.String() omits the "error" key entirely when empty.
+			isError := strings.Contains(result, `"error":"`)
+			st.notifier.NotifyToolResult(context.Background(), name, result, isError)
+		}
+	}
+	if agents.local != nil {
+		tuiLocalAgent := agents.local.
+			WithSkipPermissions(st.skipPermissions).
+			WithPermissions(localPermStore, localPermAsk).
+			WithOnOpenFile(localOpenFile).
+			WithOnToolUse(localOnToolUse).
+			WithOnToolResult(localOnToolResult).
+			WithOnThinking(func(text string) { send(thinkChunkMsg{text: text}) }).
+			WithOnReasoningPromoted(func() { send(reasoningPromotedMsg{}) })
+		tuiLocalAgent.SetBackgroundManager(agents.backgroundMgr)
+		tuiAgents.local = tuiLocalAgent
+		tuiAgents.primary = newLocalRunner(tuiLocalAgent, agents.primary.Name())
+	}
+	if agents.escalationLocal != nil {
+		tuiEscLocal := agents.escalationLocal.
+			WithSkipPermissions(st.skipPermissions).
+			WithPermissions(localPermStore, localPermAsk).
+			WithOnOpenFile(localOpenFile).
+			WithOnToolUse(localOnToolUse).
+			WithOnToolResult(localOnToolResult).
+			WithOnThinking(func(text string) { send(thinkChunkMsg{text: text}) }).
+			WithOnReasoningPromoted(func() { send(reasoningPromotedMsg{}) })
+		tuiEscLocal.SetBackgroundManager(agents.backgroundMgr)
+		tuiAgents.escalationLocal = tuiEscLocal
+		tuiAgents.escalation = newLocalRunner(tuiEscLocal, agents.escalation.Name())
+	}
+	return tuiAgents, cliPC
+}
+
+// renderScrollbar returns a single-column string of h lines showing a dim │
+// track with a bright ▌ thumb proportional to scroll position.
+// --- Memory panel poll ---
+
+func memoryPollTick() tea.Cmd {
+	return tea.Tick(memoryPollInterval, func(time.Time) tea.Msg {
+		return memoryRefreshMsg{}
+	})
+}
+
+// workflowIdleCheckInterval is how often the workflow idle watchdog checks
+// elapsed time against the current role's agent turn timeout.
+const workflowIdleCheckInterval = 15 * time.Second
+
+func workflowIdleCheck() tea.Cmd {
+	return tea.Tick(workflowIdleCheckInterval, func(time.Time) tea.Msg {
+		return workflowIdleCheckMsg{}
+	})
+}
+
+// --- Spinner ---
+
+func spinnerTick() tea.Cmd {
+	return tea.Tick(80*time.Millisecond, func(time.Time) tea.Msg {
+		return spinnerTickMsg{}
+	})
+}
+
+// --- Agent dispatch ---
+
+// replTurnSourceLabel returns the "source" label for milk.turns.total based on
+// TUI routing state: user (sticky/force), auto_sticky, or auto (router-decided).
+func replTurnSourceLabel(st *interactiveState) string {
+	if st.stickyEscalate || st.stickyPrimary {
+		return "user"
+	}
+	if st.autoStickyEscalate {
+		return "auto_sticky"
+	}
+	return "auto"
+}
+
+// runTurn routes a prompt to the appropriate agent, writing output to out.
+func runTurn(ctx context.Context, st *interactiveState, rtr *router.Router, agents *dispatchAgents, input string, out io.Writer, ir ...inputReader) error {
+	localAvail := agents.localAvail
+	escalationAvail := agents.escalationAvail
+
+	// Route first (fast), then apply the per-agent timeout so long-running
+	// escalation agents can have a higher limit than the local default.
+	forceEscalate := st.forceEscalate || st.stickyEscalate || st.autoStickyEscalate
+	forcePrimary := st.forcePrimary || st.stickyPrimary
+	routeCtx, routeCancel := context.WithTimeoutCause(ctx, agentTimeout, fmt.Errorf("turn timeout"))
+	decision, routeErr := rtr.Route(routeCtx, st.sess, input, forceEscalate, forcePrimary)
+	routeCancel()
+	if routeErr != nil {
+		return fmt.Errorf("routing: %w", routeErr)
+	}
+	st.forceEscalate = false
+	// A forcePrimary turn (single-turn /primary <prompt>) breaks auto-sticky so
+	// the next turn is re-evaluated by the router rather than staying on escalation.
+	if st.forcePrimary {
+		st.autoStickyEscalate = false
+	}
+	st.forcePrimary = false
+	// stickyEscalate/stickyPrimary/autoStickyEscalate persist until explicitly cleared.
+
+	target := decision.Target
+	if target == router.TargetLocal && !localAvail {
+		target = router.TargetEscalation
+		st.activeFallbackTarget = "escalation"
+	} else if target == router.TargetEscalation && !escalationAvail {
+		target = router.TargetLocal
+		st.activeFallbackTarget = "primary"
+	} else {
+		st.activeFallbackTarget = ""
+	}
+	defer func() { st.activeFallbackTarget = "" }()
+
+	targetName := "local"
+	agentName := st.cfg.ActiveAgent().Name
+	agentCfg := st.cfg.ActiveAgent()
+	if target == router.TargetEscalation {
+		targetName = "escalation"
+		agentCfg = st.cfg.EscalationAgentConfig()
+		agentName = agentCfg.Name
+	}
+
+	// Apply the per-agent turn timeout now that we know the target.
+	// The turn context has no hard deadline — instead, a warning is sent after the
+	// timeout period if the turn is still running, and the agent continues.
+	// The turn only terminates on explicit user cancellation (Ctrl+C) or completion.
+	timeout := st.cfg.AgentTurnTimeout(agentCfg)
+	turnCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if timeout > 0 {
+		go func() {
+			timer := time.NewTimer(timeout)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				if st.program != nil {
+					st.program.Send(turnTimeoutWarningMsg{agentName: agentName})
+				}
+			case <-turnCtx.Done():
+			}
+		}()
+	}
+	st.notifier.NotifyTurnStart(turnCtx, agentName, targetName, input)
+
+	sourceLabel := replTurnSourceLabel(st)
+	turnStart := time.Now()
+	var turnErr error
+	var pw io.Writer
+	if sw, ok := out.(*sendWriter); ok {
+		pw = &prefixWriter{send: sw.send}
+	} else {
+		pw = out
+	}
+	// onResponse is called by the dispatch layer with the agent's final text,
+	// giving us the exact text from this turn without re-scanning history.
+	var lastResponseText string
+	onResponse := func(text string) { lastResponseText = text }
+
+	// onSegment forwards each completed text chunk to remote oversight as it
+	// happens (interleaved with tool-call notifications), instead of waiting
+	// for the whole turn to finish. Only cliRunner/localRunner call it; other
+	// runners leave segmentsFired false and the final NotifyResponse below
+	// (using the full lastResponseText) covers them as before.
+	var segmentsFired bool
+	onSegment := func(text string) {
+		segmentsFired = true
+		st.notifier.NotifyResponse(turnCtx, agentName, text)
+	}
+
+	// onWorkflowStart runs on this turn's own goroutine, not the bubbletea
+	// Update() loop — it can't mutate model state or launch the workflow
+	// itself (see local.WorkflowStartSignal's doc comment). Sending a
+	// tea.Msg is the only safe way to hand this back to Update(), the same
+	// way every other cross-goroutine turn event already reaches the model.
+	onWorkflowStart := func(ws *local.WorkflowStartSignal) {
+		if st.program != nil {
+			st.program.Send(startWorkflowFromToolMsg{ws: ws})
+		}
+	}
+
+	// sessionContent is the compact version stored in history (with attachment
+	// placeholders). Falls back to input when no attachment override is set.
+	sessionContent := input
+	if st.pendingSessionContent != "" {
+		sessionContent = st.pendingSessionContent
+		st.pendingSessionContent = ""
+	}
+
+	switch target {
+	case router.TargetLocal:
+		if mem := st.mem; mem != nil {
+			defer func() {
+				_ = mem.Consolidate()
+				_ = mem.PruneGlobal(st.cfg.PerceptStoreSizeLimit())
+			}()
+		}
+		// Local path: CLI image temp files not needed; clean up.
+		cleanupCLIImageFiles(st)
+		turnErr = runPrimaryWithSession(turnCtx, st.cfg, st.sess, agents.primary, agents.escalation, st.mem, input, sessionContent, out, agents, onResponse, onSegment, onWorkflowStart, pw)
+	case router.TargetEscalation:
+		turnErr = runEscalationWithSession(turnCtx, st.cfg, st.sess, agents.escalation, "", st.mem, input, sessionContent, out, agents, onResponse, onSegment, onWorkflowStart, pw)
+		// CLI image temp files are no longer needed after the turn.
+		cleanupCLIImageFiles(st)
+	}
+	targetLabel := string(target)
+	obs.Inc(turnCtx, milkScope, "milk.turns.total",
+		attribute.String("target", targetLabel),
+		attribute.String("source", sourceLabel),
+	)
+	obs.RecordDuration(turnCtx, milkScope, "milk.turns.latency_ms", time.Since(turnStart),
+		attribute.String("target", targetLabel),
+	)
+	if turnErr != nil {
+		obs.Inc(turnCtx, milkScope, "milk.turns.errors",
+			attribute.String("target", targetLabel),
+			attribute.String("kind", "inference"),
+		)
+	}
+	st.notifier.NotifyTurnDone(turnCtx, agentName, turnErr)
+	if turnErr == nil {
+		if !segmentsFired && lastResponseText != "" {
+			st.notifier.NotifyResponse(turnCtx, agentName, lastResponseText)
+		}
+		// Auto-sticky: if the router decided to escalate (not user-pinned) and the
+		// turn succeeded, keep subsequent turns on the escalation agent.
+		// Explicit /escalate uses stickyEscalate (pinned) and is unaffected by this.
+		if target == router.TargetEscalation &&
+			!st.stickyEscalate && !st.forceEscalate &&
+			st.cfg.StickyEscalationEnabled() {
+			st.autoStickyEscalate = true
+		}
+	}
+	return turnErr
+}
+
+// --- runREPL entry point ---
+
+func runREPL(cfg config.Config, cwd string, initialFlagNew bool, initialFlagSession string, startupWarning string) error {
+	sess, err := loadSession(cwd, initialFlagNew, initialFlagSession)
+	if err != nil {
+		return fmt.Errorf("loading session: %w", err)
+	}
+
+	sessionStart := time.Now()
+	obsShutdown := initObs(cfg)
+	defer func() {
+		obs.SetGauge(context.Background(), milkScope, "milk.session.duration_ms",
+			time.Since(sessionStart).Milliseconds(),
+		)
+		obsShutdown(context.Background()) //nolint:errcheck
+	}()
+
+	var mem *memory.Store
+	if dir, err := memoryDir(); err == nil {
+		if m, err := memory.NewStore(dir, sess.ID); err == nil {
+			mem = m
+		}
+	}
+
+	var taskStore *tasks.Store
+	if dir, err := config.Dir(); err == nil {
+		tasksDir := dir + "/tasks"
+		if ts, err := tasks.New(tasksDir, sess.ID); err == nil {
+			taskStore = ts
+		}
+	}
+
+	// Build the primary agent. When the active agent is a subprocess provider
+	// (subprocess, aider-cli), bypass the HTTP local agent. When it's
+	// claude-cli, bypass both — no cheap classifier is available for it (the
+	// router already treats a nil *local.Agent as "skip step 4, attempt
+	// primary directly", same as for subprocess primaries).
+	tuiPrimaryAC := cfg.ActiveAgent()
+	var localAgent *local.Agent
+	var tuiSubprocessPrimaryAgent *subprocess.Agent
+	var tuiPrimaryCLIAgent *claude.Agent
+	if tuiPrimaryAC.IsCLI() {
+		tuiPrimaryCLIAgent = newCLIAgent(tuiPrimaryAC)
+		tuiPrimaryCLIAgent = applyAWSCreds(cfg, tuiPrimaryCLIAgent)
+		tuiPrimaryCLIAgent = tuiPrimaryCLIAgent.WithLogContext(cfg.Otel.LogContext)
+		if dbg, err := openCLIDebugLog(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "%s warning: cannot open claude debug log: %v\n", milkTag(), err)
+		} else if dbg != nil {
+			defer dbg.Close()
+			tuiPrimaryCLIAgent = tuiPrimaryCLIAgent.WithDebugLog(dbg)
+		}
+	} else if tuiPrimaryAC.IsExternalProcess() {
+		switch {
+		case tuiPrimaryAC.IsSubprocess():
+			if tuiPrimaryAC.Bin == "" {
+				if scriptPath, scriptErr := ensureSmolagentScript(); scriptErr != nil {
+					return fmt.Errorf("building subprocess primary agent: %w", scriptErr)
+				} else {
+					tuiPrimaryAC.Bin = scriptPath
+				}
+			}
+			tuiSubprocessPrimaryAgent = smolagent.New(tuiPrimaryAC)
+		case tuiPrimaryAC.IsAiderCLI():
+			tuiSubprocessPrimaryAgent = aider.New(tuiPrimaryAC)
+		}
+		if tuiSubprocessPrimaryAgent != nil {
+			tuiSubprocessPrimaryAgent = tuiSubprocessPrimaryAgent.WithLogContext(cfg.Otel.LogContext)
+			if dbg, err := openSubprocessDebugLog(cfg); err != nil {
+				fmt.Fprintf(os.Stderr, "%s warning: cannot open subprocess debug log: %v\n", milkTag(), err)
+			} else if dbg != nil {
+				defer dbg.Close()
+				tuiSubprocessPrimaryAgent = tuiSubprocessPrimaryAgent.WithDebugLog(dbg)
+			}
+		}
+	} else {
+		// Build the local agent without blocking on credential refresh. If
+		// aws_auth_refresh is enabled, the agent starts with no/stale credentials
+		// and a background goroutine refreshes them after the TUI is running.
+		baseAC := activeLocalAgentConfig(cfg)
+		localAgent = local.NewFromConfig(baseAC)
+		if od, err := config.OtelDir(); err == nil {
+			localAgent.WithOtelDir(od)
+		}
+		localAgent.WithLogContext(cfg.Otel.LogContext)
+		if taskStore != nil {
+			localAgent = localAgent.WithTaskStore(tasks.NewAdapter(taskStore))
+		}
+		if dbg, err := openLocalDebugLog(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "%s warning: cannot open local debug log: %v\n", milkTag(), err)
+		} else if dbg != nil {
+			defer dbg.Close()
+			localAgent = localAgent.WithDebugLog(dbg)
+		}
+	}
+
+	// Build the escalation agent: local provider, subprocess (subprocess, aider-cli), or claude-cli (default).
+	tuiEscAC := cfg.EscalationAgentConfig()
+	var escalationLocalAgent *local.Agent
+	var tuiSubprocessAgent *subprocess.Agent
+	switch {
+	case tuiEscAC.IsSubprocess():
+		if tuiEscAC.Bin == "" {
+			if scriptPath, scriptErr := ensureSmolagentScript(); scriptErr != nil {
+				return fmt.Errorf("building subprocess escalation agent: %w", scriptErr)
+			} else {
+				tuiEscAC.Bin = scriptPath
+			}
+		}
+		tuiSubprocessAgent = smolagent.New(tuiEscAC)
+	case tuiEscAC.IsAiderCLI():
+		tuiSubprocessAgent = aider.New(tuiEscAC)
+	default:
+	}
+	if tuiSubprocessAgent != nil {
+		tuiSubprocessAgent = tuiSubprocessAgent.WithLogContext(cfg.Otel.LogContext)
+		if dbg, err := openSubprocessDebugLog(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "%s warning: cannot open subprocess debug log: %v\n", milkTag(), err)
+		} else if dbg != nil {
+			defer dbg.Close()
+			tuiSubprocessAgent = tuiSubprocessAgent.WithDebugLog(dbg)
+		}
+	}
+	if !tuiEscAC.IsExternalProcess() {
+		escAC := applyFreshAWSCreds(cfg, tuiEscAC)
+		if escAC.URL != "" {
+			escalationLocalAgent = local.NewFromConfig(escAC).AsEscalationTarget(escAC.Name)
+			if od, err := config.OtelDir(); err == nil {
+				escalationLocalAgent.WithOtelDir(od)
+			}
+			escalationLocalAgent.WithLogContext(cfg.Otel.LogContext)
+			escalationLocalAgent = escalationLocalAgent.WithSkipPermissions(cliAgentConfig(cfg).DangerouslySkipPermissions)
+			if lp, err := local.OpenPermStore(cwd); err == nil {
+				escalationLocalAgent.WithPermissions(lp, nil)
+			}
+			if dbg, err := openLocalDebugLog(cfg); err != nil {
+				fmt.Fprintf(os.Stderr, "%s warning: cannot open local debug log: %v\n", milkTag(), err)
+			} else if dbg != nil {
+				defer dbg.Close()
+				escalationLocalAgent = escalationLocalAgent.WithDebugLog(dbg)
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "%s warning: escalation_agent %q not found in agents — falling back to claude-cli\n", milkTag(), cfg.EscalationAgent)
+		}
+	}
+
+	cliAgent := newCLIAgent(cliAgentConfig(cfg))
+	cliAgent = applyAWSCreds(cfg, cliAgent)
+	cliAgent = cliAgent.WithLogContext(cfg.Otel.LogContext)
+	if dbg, err := openCLIDebugLog(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "%s warning: cannot open claude debug log: %v\n", milkTag(), err)
+	} else if dbg != nil {
+		defer dbg.Close()
+		cliAgent = cliAgent.WithDebugLog(dbg)
+	}
+
+	ctx := context.Background()
+
+	// If the primary local agent has a run_cmd, launch it when the server is
+	// not yet reachable. This happens synchronously so the Ping below reflects
+	// the started server. A failure here is non-fatal — milk continues with the
+	// server unavailable and the user can start it manually.
+	if localAgent != nil {
+		primaryAC := activeLocalAgentConfig(cfg)
+		if primaryAC.RunCmd != "" && !isReachable(primaryAC.URL) {
+			fmt.Fprintln(os.Stderr, milkTag()+" starting local inference server…")
+			if err := ensureServerRunning(ctx, primaryAC.URL, primaryAC.RunCmd, primaryAC.Name); err != nil {
+				fmt.Fprintln(os.Stderr, milkTag()+" warning: run_cmd failed: "+err.Error())
+			}
+		}
+	}
+
+	// TUI mode continues even when both agents are unavailable so the user can
+	// add providers via /agent commands without re-launching.
+	var localAvail, escalationAvail bool
+	if tuiPrimaryCLIAgent != nil {
+		localAvail = tuiPrimaryCLIAgent.Ping() == nil
+		escalationAvail = true // CLI/local escalation checked lazily
+		if !localAvail {
+			fmt.Fprintln(os.Stderr, milkTag()+" warning: "+tuiPrimaryAC.Name+" primary agent unreachable")
+		}
+	} else if tuiSubprocessPrimaryAgent != nil {
+		localAvail = tuiSubprocessPrimaryAgent.Ping() == nil
+		escalationAvail = true // CLI/local escalation checked lazily
+		if !localAvail {
+			fmt.Fprintln(os.Stderr, milkTag()+" warning: "+tuiPrimaryAC.Name+" primary agent unreachable")
+		}
+	} else if escalationLocalAgent != nil {
+		localAvail = localAgent.Ping(ctx) == nil
+		escalationAvail = escalationLocalAgent.Ping(ctx) == nil
+		if !localAvail {
+			fmt.Fprintln(os.Stderr, milkTag()+" warning: primary agent unreachable — routing all to escalation agent")
+		}
+		if !escalationAvail {
+			fmt.Fprintln(os.Stderr, milkTag()+" warning: escalation agent unreachable — primary only")
+		}
+	} else if tuiSubprocessAgent != nil {
+		localAvail = localAgent.Ping(ctx) == nil
+		escalationAvail = tuiSubprocessAgent.Ping() == nil
+		if !localAvail {
+			fmt.Fprintln(os.Stderr, milkTag()+" warning: primary agent unreachable — routing all to escalation agent")
+		}
+		if !escalationAvail {
+			fmt.Fprintln(os.Stderr, milkTag()+" warning: "+tuiEscAC.Name+" escalation agent unreachable — primary only")
+		}
+	} else {
+		localAvail, escalationAvail, _ = checkAgentAvailability(ctx, localAgent, cliAgent)
+	}
+
+	// Pass nil routeLocalAgent when primary is a subprocess (no classifier available).
+	var routeLocalAgent *local.Agent
+	if localAvail && localAgent != nil {
+		routeLocalAgent = localAgent
+	}
+	rtr := router.New(cfg, routeLocalAgent)
+
+	if cliAgentConfig(cfg).DangerouslySkipPermissions {
+		fmt.Fprintf(os.Stderr, "%s\n", red("warning: dangerously_skip_permissions is enabled — all agents will auto-approve tool uses without prompting"))
+	}
+
+	var cs *claudesettings.Store
+	if store, err := claudesettings.Open(cwd); err == nil {
+		cs = store
+	}
+
+	var localPerms *local.PermStore
+	if lp, err := local.OpenPermStore(cwd); err == nil {
+		localPerms = lp
+	}
+
+	st := &interactiveState{sess: sess, cwd: cwd, cfg: cfg, mem: mem, cs: cs, localPerms: localPerms, toolFutures: map[string]chan string{}, skipPermissions: cliAgentConfig(cfg).DangerouslySkipPermissions, notifier: newNotifier(cfg)}
+
+	// Wire token persistence callbacks now that st is available; closures reference
+	// st.sess so they always write to the current session even after /new.
+	if localAgent != nil {
+		localAgent.WithOnTokens(func(model, role string, prompt, completion, cacheRead, cacheCreation int64) {
+			st.sess.AddTokensFull(model, role, prompt, completion, cacheRead, cacheCreation)
+		})
+		localAgent.WithOnRequestSize(func(bytes int64) {
+			if st.program != nil {
+				st.program.Send(requestSizeMsg{bytes: bytes})
+			}
+		})
+	}
+	if escalationLocalAgent != nil {
+		escalationLocalAgent.WithOnTokens(func(model, role string, prompt, completion, cacheRead, cacheCreation int64) {
+			st.sess.AddTokensFull(model, role, prompt, completion, cacheRead, cacheCreation)
+		})
+		escalationLocalAgent.WithOnRequestSize(func(bytes int64) {
+			if st.program != nil {
+				st.program.Send(requestSizeMsg{bytes: bytes})
+			}
+		})
+	}
+
+	// Build TurnRunner instances for dispatch.
+	mcpToolSets := map[string]*mcp.ToolSet{}
+	mcpServersSeen := map[string][]config.MCPServerConfig{}
+	var primaryRunner TurnRunner
+	switch {
+	case tuiPrimaryCLIAgent != nil:
+		r := newCLIRunner(tuiPrimaryCLIAgent, tuiPrimaryAC.Name,
+			permContext{cs: cs, cwd: cwd}, func() inputReader { return newStdinInputReader() })
+		if servers := cfg.EffectiveMCPServers(tuiPrimaryAC.Name); len(servers) > 0 {
+			r = r.withMCPServers(servers)
+			mcpServersSeen[tuiPrimaryAC.Name] = servers
+		}
+		primaryRunner = r
+	case tuiSubprocessPrimaryAgent != nil:
+		r := newSubprocessRunner(tuiSubprocessPrimaryAgent, tuiPrimaryAC.Name)
+		if servers, ts, _ := buildMCPToolSet(context.Background(), cfg, tuiPrimaryAC.Name); ts != nil {
+			r = r.withMCPToolSet(servers, ts)
+			mcpToolSets[tuiPrimaryAC.Name] = ts
+			mcpServersSeen[tuiPrimaryAC.Name] = servers
+			defer ts.Close(context.Background())
+		}
+		primaryRunner = r
+	case localAgent != nil:
+		if servers, ts, _ := buildMCPToolSet(context.Background(), cfg, tuiPrimaryAC.Name); ts != nil {
+			localAgent = localAgent.WithMCPToolSet(ts)
+			mcpToolSets[tuiPrimaryAC.Name] = ts
+			mcpServersSeen[tuiPrimaryAC.Name] = servers
+			defer ts.Close(context.Background())
+		}
+		primaryRunner = newLocalRunner(localAgent, tuiPrimaryAC.Name)
+	}
+	var escalationRunner TurnRunner
+	switch {
+	case tuiSubprocessAgent != nil:
+		r := newSubprocessRunner(tuiSubprocessAgent, tuiEscAC.Name)
+		if servers, ts, _ := buildMCPToolSet(context.Background(), cfg, tuiEscAC.Name); ts != nil {
+			r = r.withMCPToolSet(servers, ts)
+			mcpToolSets[tuiEscAC.Name] = ts
+			mcpServersSeen[tuiEscAC.Name] = servers
+			defer ts.Close(context.Background())
+		}
+		escalationRunner = r
+	case escalationLocalAgent != nil:
+		if servers, ts, _ := buildMCPToolSet(context.Background(), cfg, tuiEscAC.Name); ts != nil {
+			escalationLocalAgent = escalationLocalAgent.WithMCPToolSet(ts)
+			mcpToolSets[tuiEscAC.Name] = ts
+			mcpServersSeen[tuiEscAC.Name] = servers
+			defer ts.Close(context.Background())
+		}
+		escalationRunner = newLocalRunner(escalationLocalAgent, tuiEscAC.Name)
+	default:
+		cliAC := cliAgentConfig(cfg)
+		escName := cliAC.Name
+		if escName == "" {
+			escName = "claude"
+		}
+		cr := newCLIRunner(cliAgent, escName,
+			permContext{cs: cs, cwd: cwd}, func() inputReader { return newStdinInputReader() })
+		if servers := cfg.EffectiveMCPServers(cliAC.Name); len(servers) > 0 {
+			cr = cr.withMCPServers(servers)
+			mcpServersSeen[cliAC.Name] = servers
+		}
+		escalationRunner = cr
+	}
+
+	agents := dispatchAgents{
+		primary:           primaryRunner,
+		escalation:        escalationRunner,
+		local:             localAgent,
+		cliAgent:          cliAgent,
+		escalationLocal:   escalationLocalAgent,
+		subprocessAgent:   tuiSubprocessAgent,
+		subprocessPrimary: tuiSubprocessPrimaryAgent,
+		localAvail:        localAvail,
+		escalationAvail:   escalationAvail,
+		mcpToolSets:       mcpToolSets,
+		mcpServersSeen:    mcpServersSeen,
+		// Constructed once per session, not per turn (ADR-0043): ctx here is
+		// the session/TUI-root context, not any single turn's cancellable
+		// one — see the Manager doc comment for why that distinction matters.
+		backgroundMgr: local.NewManager(ctx, cfg.EffectiveMaxBackgroundAgents()),
+	}
+	agents.backgroundMgr.SetJobTimeout(cfg.EffectiveBackgroundAgentTimeout())
+	// Persist job records (ADR-0043 triage): a killed milk leaves each job's
+	// last-known status, result and heartbeat timestamp on disk — see
+	// internal/agent/local's jobstore.go. Best-effort: a home dir milk can't
+	// write to just means no persistence, never a failed session.
+	if cfgDir, dirErr := config.Dir(); dirErr == nil && sess.ID != "" {
+		agents.backgroundMgr.SetStateFile(cfgDir + "/jobs/" + sess.ID + ".json")
+	}
+
+	m := newModel(ctx, st, rtr, agents, mem)
+	m.taskStore = taskStore
+	m.hasInferenceAgent = cfg.HasInferenceAgent()
+	if startupWarning != "" {
+		m.startupWarnings = append(m.startupWarnings, startupWarning)
+	}
+	for _, w := range config.Validate(cfg) {
+		m.startupWarnings = append(m.startupWarnings, w.String())
+	}
+	m.colorizeMode = ParseColorizeMode(cfg.Colorization)
+	if needsAWSRefresh(cfg) {
+		m.credRefreshing = true
+		m.credLabel = "AWS"
+	} else if localAgent != nil && needsTokenCmdRefresh(cfg) {
+		m.credRefreshing = true
+		m.credLabel = "token"
+	}
+	if gp, err := globalHistoryPath(); err == nil {
+		m.globalHistory = readHistoryFile(gp)
+	}
+	if sp, err := sessionHistoryPath(sess.ID); err == nil {
+		m.sessionHistory = readHistoryFile(sp)
+	}
+
+	// Credential refresh is deferred to Init() via credRefreshInit so that
+	// the tea.Cmd runs only after the bubbletea event loop is fully started.
+	// Goroutines that call p.Send() before p.Run() race with TUI init and
+	// can corrupt the layout (duplicate prompts / status bars).
+	if needsAWSRefresh(cfg) {
+		awsCmd := claudesettings.AWSAuthRefreshCommand()
+		m.credRefreshInit = func() tea.Msg {
+			refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			creds, err := claude.ResolveAWSCredsContext(refreshCtx, awsCmd)
+			return credRefreshReadyMsg{label: "AWS", creds: creds, err: err}
+		}
+	} else if localAgent != nil && needsTokenCmdRefresh(cfg) {
+		m.credRefreshInit = func() tea.Msg {
+			err := localAgent.WarmToken()
+			return credRefreshReadyMsg{label: "token", err: err}
+		}
+	}
+
+	// Check for a saved workflow state file for the current session.
+	// Deferred to Init() for the same reason as credRefreshInit.
+	{
+		sessID := sess.ID
+		m.workflowResumeInit = func() tea.Msg {
+			stateDir, err := session.Dir()
+			if err != nil {
+				return workflowResumeCheckMsg{}
+			}
+			id, kind, err := workflow.CurrentWorkflowID(stateDir, sessID)
+			if err != nil || kind == workflow.WorkflowKindNone {
+				return workflowResumeCheckMsg{}
+			}
+			if kind == workflow.WorkflowKindInterp {
+				cp, err := interp.LoadCheckpoint(workflow.InterpCheckpointPath(stateDir, sessID, id))
+				if err != nil || cp == nil || cp.Done {
+					return workflowResumeCheckMsg{}
+				}
+				return workflowResumeCheckMsg{genericName: cp.DefinitionName, genericTask: cp.Task}
+			}
+			st, err := workflow.LoadState(workflow.StatePath(stateDir, sessID, id))
+			if err != nil || st == nil {
+				return workflowResumeCheckMsg{}
+			}
+			return workflowResumeCheckMsg{state: st}
+		}
+	}
+
+	p := tea.NewProgram(m,
+		tea.WithAltScreen(),
+	)
+	st.program = p
+
+	// Notify the TUI as soon as each background job (ADR-0043) completes,
+	// independent of the turn-boundary drain path.
+	if agents.backgroundMgr != nil {
+		agents.backgroundMgr.SetOnStart(func(*local.Job) {
+			p.Send(backgroundJobStartedMsg{})
+		})
+		agents.backgroundMgr.SetOnDone(func(j *local.Job) {
+			p.Send(backgroundJobDoneMsg{job: j})
+			// User-initiated jobs (Role == "user", tagged by the busy-key
+			// spawn flow) have no "wave" to consolidate — deliver as soon
+			// as the model is free rather than waiting for
+			// SetOnBatchDone, which only fires once every job (agent- or
+			// user-initiated) is done.
+			if j.Role == "user" {
+				p.Send(backgroundUserJobDoneMsg{})
+			}
+		})
+		// And, once the whole wave has finished, actually trigger a
+		// follow-up turn (see maybeAutoFollowupBackgroundJobs) — without
+		// this, "I'll follow up automatically" is never true: results just
+		// sit in the Manager's queue until some other turn happens to be
+		// dispatched.
+		agents.backgroundMgr.SetOnBatchDone(func() {
+			p.Send(backgroundBatchDoneMsg{})
+		})
+	}
+
+	// Wire task store redraw: when tasks change, send a tick to trigger View()
+	// and (unless the user has manually closed it) auto-open the tasks panel.
+	if taskStore != nil {
+		taskStore.SetOnChange(func() {
+			p.Send(taskStoreChangedMsg{})
+		})
+	}
+
+	// Start a config watcher so the TUI updates automatically when config.json
+	// changes on disk (e.g. the user edits it in another terminal). The dual
+	// watcher monitors both the global config and any local .milk/config.json,
+	// deep-merging them on every change.
+	if cfgDir, cfgDirErr := config.Dir(); cfgDirErr == nil {
+		cfgPath := cfgDir + "/config.json"
+		localPath, _ := config.LocalConfigPath()
+		watcher, watchErr := config.NewDualWatcher(cfgPath, localPath, func(newCfg config.Config, err error) {
+			p.Send(configReloadMsg{cfg: newCfg, err: err})
+		})
+		if watchErr == nil {
+			defer watcher.Close()
+		}
+	}
+	if localAgent != nil {
+		localAgent.WithOnSigV4Refresh(func(err error) {
+			p.Send(credRefreshReadyMsg{label: "AWS", err: err})
+		})
+	}
+
+	// Wire remote input: messages from the oversight backend are injected as turns.
+	if tn, ok := st.notifier.(interface {
+		SetOnInput(func(string))
+		StartPolling(context.Context)
+	}); ok {
+		tn.SetOnInput(func(text string) {
+			p.Send(remoteInputMsg{text: text})
+		})
+		tn.StartPolling(ctx)
+	}
+
+	// Mode 1000+1006 at rest: X10 basic mouse tracking + SGR extension. Wheel
+	// scroll is reliably reported as tea.MouseMsg under 1000; some terminals
+	// fall back to arrow-key emulation for wheel scroll when button-motion
+	// mode (1002) is left enabled at rest instead. setMouseDragMode switches
+	// to 1002 only for the duration of an active drag, when motion events are
+	// actually needed for live selection-highlight updates.
+	os.Stdout.WriteString("\x1b[?1000h\x1b[?1006h") //nolint:errcheck
+	finalModel, err := p.Run()
+	os.Stdout.WriteString("\x1b[?1006l\x1b[?1002l\x1b[?1000l") //nolint:errcheck
+
+	if fm, ok := finalModel.(model); ok {
+		if gp, err := globalHistoryPath(); err == nil {
+			writeHistoryFile(gp, fm.globalHistory)
+		}
+		sessID := sess.ID
+		if fm.st != nil && fm.st.sess != nil {
+			sessID = fm.st.sess.ID
+		}
+		if sp, err := sessionHistoryPath(sessID); err == nil {
+			writeHistoryFile(sp, fm.sessionHistory)
+		}
+	}
+	if mem != nil {
+		_ = mem.Consolidate()
+		_ = mem.PruneGlobal(cfg.PerceptStoreSizeLimit())
+	}
+	return err
+}

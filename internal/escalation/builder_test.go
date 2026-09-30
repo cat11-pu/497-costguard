@@ -1,0 +1,491 @@
+package escalation
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/scoutme/milk/internal/session"
+)
+
+func TestBuildContext_EmptySession(t *testing.T) {
+	sess := &session.Session{}
+	got := BuildContext(sess, "testnonce", nil, ContextModeFirst, true, "", "")
+	if !strings.Contains(got, "milk:percept:testnonce") {
+		t.Errorf("expected percept nonce in output, got %q", got)
+	}
+	if !strings.Contains(got, "milk:need:testnonce") {
+		t.Errorf("expected need nonce in output, got %q", got)
+	}
+}
+
+func TestBuildContext_CurrentNeed(t *testing.T) {
+	sess := &session.Session{CurrentNeed: "implement JWT auth"}
+	got := BuildContext(sess, "n1", nil, ContextModeFirst, true, "", "")
+	if !strings.Contains(got, "implement JWT auth") {
+		t.Errorf("expected CurrentNeed in output, got %q", got)
+	}
+	if !strings.Contains(got, "[Current user goal]") {
+		t.Errorf("expected goal header in output, got %q", got)
+	}
+}
+
+func TestBuildContext_CurrentNeed_FreshLabel(t *testing.T) {
+	sess := &session.Session{
+		CurrentNeed:      "implement JWT auth",
+		CurrentNeedSetAt: 4, // 1-based: set when len(History)=3 → turnsAgo = 5-(4-1) = 2 → fresh
+		History:          make([]session.Turn, 5),
+	}
+	got := BuildContext(sess, "n1", nil, ContextModeFirst, true, "", "")
+	if !strings.Contains(got, "[Current user goal]") {
+		t.Errorf("recent need should use fresh header, got %q", got)
+	}
+	if strings.Contains(got, "may already be fulfilled") {
+		t.Errorf("recent need should not carry stale warning, got %q", got)
+	}
+}
+
+func TestBuildContext_CurrentNeed_StaleLabel(t *testing.T) {
+	sess := &session.Session{
+		CurrentNeed:      "implement JWT auth",
+		CurrentNeedSetAt: 2, // 1-based: set when len(History)=1 → turnsAgo = 6-(2-1) = 5 → stale
+		History:          make([]session.Turn, 6),
+	}
+	got := BuildContext(sess, "n1", nil, ContextModeFirst, true, "", "")
+	if strings.Contains(got, "[Current user goal]") {
+		t.Errorf("stale need should not use fresh header, got %q", got)
+	}
+	if !strings.Contains(got, "may already be fulfilled") {
+		t.Errorf("stale need should carry stale warning, got %q", got)
+	}
+	if !strings.Contains(got, "implement JWT auth") {
+		t.Errorf("stale need content should still be present, got %q", got)
+	}
+}
+
+func TestBuildContext_NoNeedWhenEmpty(t *testing.T) {
+	sess := &session.Session{}
+	got := BuildContext(sess, "n1", nil, ContextModeFirst, true, "", "")
+	if strings.Contains(got, "[Current user goal]") {
+		t.Error("empty CurrentNeed should not produce goal block")
+	}
+}
+
+func TestBuildContext_EscalationBrief_FirstEscalation(t *testing.T) {
+	sess := &session.Session{EscalationBrief: "stuck on nil pointer in auth.go"}
+	got := BuildContext(sess, "n1", nil, ContextModeFirst, true, "", "")
+	if !strings.Contains(got, "stuck on nil pointer in auth.go") {
+		t.Errorf("expected EscalationBrief in first-escalation output, got %q", got)
+	}
+}
+
+func TestBuildContext_EscalationBrief_SkippedOnResume(t *testing.T) {
+	sess := &session.Session{EscalationBrief: "stuck on nil pointer in auth.go"}
+	got := BuildContext(sess, "n1", nil, ContextModeResume, false, "", "")
+	if strings.Contains(got, "stuck on nil pointer in auth.go") {
+		t.Error("EscalationBrief should not appear on resume")
+	}
+}
+
+func TestBuildContext_EscalationBrief_IncludedOnReturning(t *testing.T) {
+	sess := &session.Session{EscalationBrief: "stuck on nil pointer in auth.go"}
+	got := BuildContext(sess, "n1", nil, ContextModeReturning, true, "", "")
+	if !strings.Contains(got, "stuck on nil pointer in auth.go") {
+		t.Errorf("expected EscalationBrief on returning, got %q", got)
+	}
+}
+
+func TestBuildContext_LastLocalSummary(t *testing.T) {
+	sess := &session.Session{LastLocalSummary: "User: fix typo\nAssistant (primary): done"}
+	got := BuildContext(sess, "n1", nil, ContextModeFirst, true, "", "")
+	if !strings.Contains(got, "fix typo") {
+		t.Errorf("expected LastLocalSummary in output, got %q", got)
+	}
+	if !strings.Contains(got, "[Recent primary agent activity]") {
+		t.Errorf("expected primary activity header, got %q", got)
+	}
+}
+
+func TestBuildContext_NoLocalSummaryBlock_WhenEmpty(t *testing.T) {
+	sess := &session.Session{}
+	got := BuildContext(sess, "n1", nil, ContextModeFirst, true, "", "")
+	if strings.Contains(got, "[Recent primary agent activity]") {
+		t.Error("empty LastLocalSummary should not produce activity block")
+	}
+}
+
+func TestBuildContext_WithPercepts(t *testing.T) {
+	sess := &session.Session{}
+	got := BuildContext(sess, "n1", []string{"user prefers Go", "use flat files"}, ContextModeFirst, true, "", "")
+	if !strings.Contains(got, "[Remembered facts]") {
+		t.Errorf("expected [Remembered facts] block, got %q", got)
+	}
+	if !strings.Contains(got, "user prefers Go") {
+		t.Errorf("expected percept in output, got %q", got)
+	}
+}
+
+func TestBuildContext_NilPercepts(t *testing.T) {
+	sess := &session.Session{}
+	got := BuildContext(sess, "n1", nil, ContextModeFirst, true, "", "")
+	if strings.Contains(got, "[Remembered facts]") {
+		t.Error("nil percepts should not produce facts block")
+	}
+}
+
+func TestBuildContext_ResumeIncludesLocalSummary(t *testing.T) {
+	// Resume omits need/instructions — only the changed primary summary is sent.
+	// The legacy BuildContext returns only the dynamic part on resume; the identity
+	// block lives in BuildStaticContext (used by the split API, not this legacy path).
+	sess := &session.Session{
+		LastLocalSummary: "User: run tests",
+		CurrentNeed:      "fix failing tests",
+	}
+	got := BuildContext(sess, "n1", nil, ContextModeResume, false, "", "")
+	if strings.Contains(got, "fix failing tests") {
+		t.Error("resume should not include CurrentNeed (already cached in Claude's context)")
+	}
+	if strings.Contains(got, identityBlock) {
+		t.Error("legacy BuildContext on resume returns dynamic only — no identity block")
+	}
+	if !strings.Contains(got, "run tests") {
+		t.Errorf("expected LastLocalSummary on resume, got %q", got)
+	}
+}
+
+func TestBuildContext_ReturningDoesNotIncludeEscalationSummary(t *testing.T) {
+	// ContextModeReturning uses --resume so Claude already has its history in context.
+	// Injecting the escalation summary would be redundant and bust the prompt cache.
+	sess := &session.Session{
+		LastEscalationSummary: "User: implement feature\nAssistant (escalation): done",
+		CurrentNeed:           "polish the UI",
+	}
+	got := BuildContext(sess, "n1", nil, ContextModeReturning, false, "", "")
+	if strings.Contains(got, "[Recent escalation agent activity]") {
+		t.Error("returning mode should not include escalation summary block (uses --resume)")
+	}
+	if strings.Contains(got, "implement feature") {
+		t.Error("returning mode should not inject escalation summary content (uses --resume)")
+	}
+	if !strings.Contains(got, "polish the UI") {
+		t.Errorf("expected CurrentNeed on returning, got %q", got)
+	}
+}
+
+func TestBuildContext_FirstIncludesPriorEscalationSummary(t *testing.T) {
+	// When a fresh session is forced (e.g. needStale), the prior escalation summary
+	// must be injected so Claude remembers what was discussed before the topic shift.
+	sess := &session.Session{
+		LastEscalationSummary: "discussed Option A vs Option B for auth redesign",
+	}
+	got := BuildContext(sess, "n1", nil, ContextModeFirst, true, "", "")
+	if !strings.Contains(got, "[Prior escalation session summary") {
+		t.Error("ContextModeFirst should include prior escalation summary when non-empty")
+	}
+	if !strings.Contains(got, "Option A vs Option B") {
+		t.Error("ContextModeFirst should include prior escalation summary content")
+	}
+}
+
+func TestBuildContext_FirstNoEscalationSummaryWhenEmpty(t *testing.T) {
+	sess := &session.Session{}
+	got := BuildContext(sess, "n1", nil, ContextModeFirst, true, "", "")
+	if strings.Contains(got, "[Prior escalation session summary") {
+		t.Error("ContextModeFirst should not include escalation summary block when empty")
+	}
+}
+
+func TestBuildContext_SkipsInstructionsWhenFlagFalse(t *testing.T) {
+	sess := &session.Session{}
+	got := BuildContext(sess, "n1", []string{"a fact"}, ContextModeResume, false, "", "")
+	if strings.Contains(got, "milk:percept:n1") {
+		t.Error("injectInstructions=false should omit memory instruction")
+	}
+	if strings.Contains(got, "milk:need:n1") {
+		t.Error("injectInstructions=false should omit need instruction")
+	}
+	if strings.Contains(got, "[Remembered facts]") {
+		t.Error("injectInstructions=false should omit percepts block")
+	}
+}
+
+func TestBuildContext_InjectsInstructionsOnResumeWhenFlagTrue(t *testing.T) {
+	// Resume ignores injectInstructions — Claude already has them cached.
+	sess := &session.Session{CurrentNeed: "build auth"}
+	got := BuildContext(sess, "n1", []string{"a fact"}, ContextModeResume, true, "", "")
+	if strings.Contains(got, "milk:percept:n1") {
+		t.Error("resume should not include memory instruction (already cached)")
+	}
+	if strings.Contains(got, "milk:need:n1") {
+		t.Error("resume should not include need instruction (already cached)")
+	}
+	if strings.Contains(got, "[Remembered facts]") {
+		t.Error("resume should not include percepts block (already cached)")
+	}
+}
+
+// --- BuildStaticContext / BuildDynamicContext split tests ---
+
+func TestBuildStaticContext_ContainsInstructions(t *testing.T) {
+	got := BuildStaticContext("n1", []string{"a fact"}, ContextModeFirst, true, "primary", "claude")
+	if !strings.Contains(got, "milk:percept:n1") {
+		t.Error("static context should contain memory instruction")
+	}
+	if !strings.Contains(got, "milk:need:n1") {
+		t.Error("static context should contain need instruction")
+	}
+	if !strings.Contains(got, "[Remembered facts]") {
+		t.Error("static context should contain percepts")
+	}
+}
+
+func TestBuildStaticContext_IdentityOnResumeNoReinjection(t *testing.T) {
+	got := BuildStaticContext("n1", []string{"a fact"}, ContextModeResume, false, "primary", "claude")
+	if got == "" {
+		t.Error("static context should contain identity block on resume even when injectInstructions=false")
+	}
+	if !strings.Contains(got, identityBlock) {
+		t.Errorf("static context should contain identity block on resume, got %q", got)
+	}
+	if strings.Contains(got, "milk:percept") {
+		t.Error("static context should not contain instructions when injectInstructions=false")
+	}
+}
+
+func TestBuildStaticContext_ReinjectedOnResumeWhenThresholdCrossed(t *testing.T) {
+	got := BuildStaticContext("n1", []string{"a fact"}, ContextModeResume, true, "primary", "claude")
+	if got == "" {
+		t.Error("static context should be re-injected on resume when injectInstructions=true")
+	}
+	if !strings.Contains(got, "milk:percept") {
+		t.Error("re-injected static context should contain memory instruction")
+	}
+}
+
+func TestBuildStaticContext_IdentityWhenNoInject(t *testing.T) {
+	got := BuildStaticContext("n1", []string{"a fact"}, ContextModeFirst, false, "primary", "claude")
+	if got == "" {
+		t.Error("static context should contain identity block even when injectInstructions=false")
+	}
+	if !strings.Contains(got, identityBlock) {
+		t.Errorf("static context should contain identity block, got %q", got)
+	}
+	if strings.Contains(got, "milk:percept") {
+		t.Error("static context should not contain instructions when injectInstructions=false")
+	}
+}
+
+func TestBuildDynamicContext_ContainsNeedAndBrief(t *testing.T) {
+	sess := &session.Session{
+		CurrentNeed:      "fix the bug",
+		EscalationBrief:  "nil pointer in auth.go",
+		LastLocalSummary: "User: run tests\nAssistant: done",
+	}
+	got := BuildDynamicContext(sess, ContextModeFirst, nil)
+	if strings.Contains(got, identityBlock) {
+		t.Error("dynamic context should NOT contain identity block (moved to static)")
+	}
+	if !strings.Contains(got, "fix the bug") {
+		t.Error("dynamic context should contain CurrentNeed")
+	}
+	if !strings.Contains(got, "nil pointer in auth.go") {
+		t.Error("dynamic context should contain EscalationBrief")
+	}
+	if !strings.Contains(got, "run tests") {
+		t.Error("dynamic context should contain LastLocalSummary")
+	}
+}
+
+func TestBuildDynamicContext_ResumeOnlyChangedSummary(t *testing.T) {
+	sess := &session.Session{
+		CurrentNeed:      "fix the bug",
+		LastLocalSummary: "User: run tests",
+	}
+	got := BuildDynamicContext(sess, ContextModeResume, nil)
+	if strings.Contains(got, identityBlock) {
+		t.Error("dynamic context on resume should not contain identity block")
+	}
+	if strings.Contains(got, "fix the bug") {
+		t.Error("dynamic context on resume should not contain CurrentNeed")
+	}
+	if !strings.Contains(got, "run tests") {
+		t.Error("dynamic context on resume should contain LastLocalSummary")
+	}
+}
+
+func TestBuildDynamicContext_ResumeEmptyWhenSummaryUnchanged(t *testing.T) {
+	sess := &session.Session{
+		LastLocalSummary:         "User: run tests",
+		LastLocalSummaryInjected: "User: run tests",
+	}
+	got := BuildDynamicContext(sess, ContextModeResume, nil)
+	if got != "" {
+		t.Errorf("dynamic context on resume should be empty when summary unchanged, got %q", got)
+	}
+}
+
+func TestBuildDynamicContext_ResumeSurfacesNewPercept(t *testing.T) {
+	sess := &session.Session{EscalationPerceptsInjected: []string{"fact A"}}
+	got := BuildDynamicContext(sess, ContextModeResume, []string{"fact A", "fact B"})
+	if !strings.Contains(got, "[New remembered facts]") {
+		t.Error("expected a new-percepts block when a percept was recorded since the last injection")
+	}
+	if !strings.Contains(got, "fact B") {
+		t.Error("expected the new percept's content in the block")
+	}
+	if got2 := "\n" + got; strings.Count(got2, "fact A") != 0 {
+		t.Errorf("expected the already-injected percept NOT to be re-announced, got %q", got)
+	}
+	if len(sess.EscalationPerceptsInjected) != 2 {
+		t.Errorf("expected EscalationPerceptsInjected to snapshot both percepts, got %v", sess.EscalationPerceptsInjected)
+	}
+}
+
+func TestBuildDynamicContext_ResumeNoNewPercepts(t *testing.T) {
+	sess := &session.Session{EscalationPerceptsInjected: []string{"fact A"}}
+	got := BuildDynamicContext(sess, ContextModeResume, []string{"fact A"})
+	if strings.Contains(got, "[New remembered facts]") {
+		t.Errorf("expected no new-percepts block when nothing changed, got %q", got)
+	}
+}
+
+func TestBuildDynamicContext_ContinuationSurfacesNewPercept(t *testing.T) {
+	sess := &session.Session{EscalationPerceptsInjected: []string{"fact A"}}
+	got := BuildDynamicContext(sess, ContextModeContinuation, []string{"fact A", "fact B"})
+	if !strings.Contains(got, "[New remembered facts]") || !strings.Contains(got, "fact B") {
+		t.Errorf("expected the new percept surfaced on a continuation turn too, got %q", got)
+	}
+}
+
+func TestBuildDynamicContext_FirstModeSnapshotsPercepts(t *testing.T) {
+	sess := &session.Session{}
+	_ = BuildDynamicContext(sess, ContextModeFirst, []string{"fact A", "fact B"})
+	if len(sess.EscalationPerceptsInjected) != 2 {
+		t.Errorf("expected First mode to snapshot the delivered percepts (via static context) for future diffing, got %v", sess.EscalationPerceptsInjected)
+	}
+}
+
+func TestBuildStaticContext_ContainsIdentityBlock(t *testing.T) {
+	got := BuildStaticContext("n1", nil, ContextModeFirst, true, "primary", "claude")
+	if !strings.Contains(got, identityBlock) {
+		t.Error("static context should contain identity block")
+	}
+}
+
+func TestBuildDynamicContext_DoesNotContainInstructions(t *testing.T) {
+	sess := &session.Session{}
+	got := BuildDynamicContext(sess, ContextModeFirst, nil)
+	if strings.Contains(got, "milk:percept:") {
+		t.Error("dynamic context should not contain memory instruction")
+	}
+	if strings.Contains(got, "milk:need:") {
+		t.Error("dynamic context should not contain need instruction")
+	}
+}
+
+func TestMemoryInstruction_NonceInTag(t *testing.T) {
+	got := MemoryInstruction("abc123", "primary", "escalation")
+	if !strings.Contains(got, "<milk:percept:abc123>") {
+		t.Errorf("expected nonce open tag, got %q", got)
+	}
+	if !strings.Contains(got, "</milk:percept:abc123>") {
+		t.Errorf("expected nonce close tag, got %q", got)
+	}
+}
+
+func TestNeedInstruction_NonceInTag(t *testing.T) {
+	got := NeedInstruction("abc123")
+	if !strings.Contains(got, "<milk:need:abc123>") {
+		t.Errorf("expected need open tag, got %q", got)
+	}
+	if !strings.Contains(got, "</milk:need:abc123>") {
+		t.Errorf("expected need close tag, got %q", got)
+	}
+}
+
+func TestFormatPercepts_NonEmpty(t *testing.T) {
+	got := FormatPercepts([]string{"user prefers Go", "flat files only"})
+	if !strings.Contains(got, "[Remembered facts]") {
+		t.Error("expected [Remembered facts] header")
+	}
+	if !strings.Contains(got, "user prefers Go") || !strings.Contains(got, "flat files only") {
+		t.Error("expected percept content")
+	}
+}
+
+func TestFormatPercepts_Empty(t *testing.T) {
+	if got := FormatPercepts(nil); got != "" {
+		t.Errorf("expected empty string for nil percepts, got %q", got)
+	}
+	if got := FormatPercepts([]string{}); got != "" {
+		t.Errorf("expected empty string for empty percepts, got %q", got)
+	}
+}
+
+// --- ContextModeContinuation tests ---
+
+func TestBuildStaticContext_ContinuationIdentityOnly(t *testing.T) {
+	cases := []struct {
+		name               string
+		injectInstructions bool
+	}{
+		{"inject false", false},
+		{"inject true", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := BuildStaticContext("n1", []string{"a fact"}, ContextModeContinuation, tc.injectInstructions, "primary", "claude")
+			if !strings.Contains(got, identityBlock) {
+				t.Errorf("BuildStaticContext on ContextModeContinuation should contain identity block, got %q", got)
+			}
+			if strings.Contains(got, "milk:percept") {
+				t.Error("BuildStaticContext on ContextModeContinuation should not contain instructions")
+			}
+			if strings.Contains(got, "milk:need") {
+				t.Error("BuildStaticContext on ContextModeContinuation should not contain need instruction")
+			}
+		})
+	}
+}
+
+func TestBuildDynamicContext_ContinuationOnlyChangedSummary(t *testing.T) {
+	sess := &session.Session{
+		CurrentNeed:      "fix the bug",
+		EscalationBrief:  "nil pointer in auth.go",
+		LastLocalSummary: "User: run tests",
+	}
+	got := BuildDynamicContext(sess, ContextModeContinuation, nil)
+	if strings.Contains(got, identityBlock) {
+		t.Error("dynamic context on continuation should not contain identity block")
+	}
+	if strings.Contains(got, "fix the bug") {
+		t.Error("dynamic context on continuation should not contain CurrentNeed")
+	}
+	if strings.Contains(got, "nil pointer in auth.go") {
+		t.Error("dynamic context on continuation should not contain EscalationBrief")
+	}
+	if !strings.Contains(got, "run tests") {
+		t.Errorf("dynamic context on continuation should contain changed LastLocalSummary, got %q", got)
+	}
+}
+
+func TestBuildDynamicContext_ContinuationEmptyWhenSummaryUnchanged(t *testing.T) {
+	sess := &session.Session{
+		LastLocalSummary:         "User: run tests",
+		LastLocalSummaryInjected: "User: run tests",
+	}
+	got := BuildDynamicContext(sess, ContextModeContinuation, nil)
+	if got != "" {
+		t.Errorf("dynamic context on continuation should be empty when summary unchanged, got %q", got)
+	}
+}
+
+func TestBuildDynamicContext_ContinuationEmptyWhenNoSummary(t *testing.T) {
+	sess := &session.Session{
+		CurrentNeed:     "fix the bug",
+		EscalationBrief: "nil pointer",
+	}
+	got := BuildDynamicContext(sess, ContextModeContinuation, nil)
+	if got != "" {
+		t.Errorf("dynamic context on continuation with no summary should be empty, got %q", got)
+	}
+}
